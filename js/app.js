@@ -46,7 +46,7 @@ function setAuthTab(tab) {
   setAuthMessage('');
 }
 function showAuth(tab = 'login') { authScreen.hidden = false; app.hidden = true; setAuthTab(tab); }
-function showApp() { authScreen.hidden = true; app.hidden = false; $('#connection-state').textContent = 'Connected'; }
+function showApp() { authScreen.hidden = true; app.hidden = false; }
 function updateIdentity() {
   const name = currentProfile?.display_name || currentUser?.user_metadata?.display_name || 'Your name';
   const username = currentProfile?.username || currentUser?.user_metadata?.username || 'username';
@@ -64,7 +64,7 @@ function go(view) {
   if (location.hash !== '#' + currentView) history.replaceState(null, '', '#' + currentView);
   $$('.nav-link').forEach(a => a.classList.toggle('active', a.dataset.view === currentView));
   $('#breadcrumb').textContent = titles[currentView];
-  $('#sidebar').classList.remove('mobile-open');
+  closeMobileSidebar();
   renderView();
 }
 function errorText(error) { return error?.message || 'Something went wrong. Please try again.'; }
@@ -108,9 +108,9 @@ function initNotificationUI() {
   if ($('#notification-button')) return;
   const actions = $('.topbar-actions');
   if (!actions) return;
-  actions.insertAdjacentHTML('afterbegin', `<div class="notification-wrap"><button id="notification-button" class="button subtle notification-button" type="button" aria-expanded="false">♢ Notifications <span id="notification-badge" class="notification-badge" hidden>0</span></button><div id="notification-panel" class="notification-panel" hidden><div class="notification-panel-head"><strong>Notifications</strong><button type="button" id="notification-close" class="text-button">Close</button></div><div id="notification-content"><p class="muted">Loading…</p></div></div></div>`);
+  actions.insertAdjacentHTML('afterbegin', `<div class="notification-wrap"><button id="notification-button" class="icon-button topbar-icon notification-button" type="button" aria-label="Notifications" aria-expanded="false" data-tooltip="Notifications" title="Notifications"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9"></path><path d="M10 21h4"></path></svg><span id="notification-badge" class="notification-badge" hidden>0</span></button><div id="notification-panel" class="notification-panel" hidden><div class="notification-panel-head"><strong>Notifications</strong><button type="button" id="notification-close" class="text-button">Close</button></div><div id="notification-content"><p class="muted">Loading…</p></div></div></div>`);
   const style = document.createElement('style');
-  style.textContent = `.notification-wrap{position:relative}.notification-button{white-space:nowrap}.notification-badge,.nav-count{display:inline-flex;align-items:center;justify-content:center;min-width:18px;height:18px;padding:0 5px;border-radius:10px;background:var(--danger);color:white;font-size:11px;font-weight:700;margin-left:5px}.nav-count{margin-left:auto}.notification-panel{position:absolute;right:0;top:calc(100% + 9px);width:min(360px,calc(100vw - 28px));max-height:min(70vh,520px);overflow:auto;background:var(--paper);border:1px solid var(--line);z-index:30;padding:12px;box-shadow:0 5px 18px #0002}.notification-panel-head{display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid var(--line);padding-bottom:9px;margin-bottom:8px}.notification-group{margin:12px 0}.notification-group h4{font-size:12px;color:var(--muted);margin:0 0 5px;text-transform:uppercase;letter-spacing:.05em}.notification-item{display:block;width:100%;text-align:left;padding:9px 4px;background:none;color:var(--text);border:0;border-bottom:1px solid var(--line);font-size:13px}.notification-item:hover{background:var(--soft)}.notification-item small{display:block;margin-top:3px}.notification-empty{font-size:13px;color:var(--muted);padding:8px 0}.sidebar .nav-link{gap:9px}`;
+  style.textContent = `.notification-wrap{position:relative}.notification-badge,.nav-count{display:inline-flex;align-items:center;justify-content:center;min-width:18px;height:18px;padding:0 5px;border-radius:10px;background:var(--danger);color:white;font-size:11px;font-weight:700}.notification-badge{position:absolute;top:-4px;right:-5px;border:2px solid var(--paper)}.nav-count{margin-left:auto}.notification-panel{position:absolute;right:0;top:calc(100% + 10px);width:min(370px,calc(100vw - 28px));max-height:min(72vh,540px);overflow:auto;overscroll-behavior:contain;background:var(--paper);border:1px solid var(--line);z-index:40;padding:14px;box-shadow:0 5px 18px #0002}.notification-panel-head{display:flex;justify-content:space-between;align-items:center;position:sticky;top:-14px;background:var(--paper);border-bottom:1px solid var(--line);padding:8px 0 10px;margin-bottom:8px;z-index:1}.notification-group{margin:12px 0}.notification-group h4{font-size:12px;color:var(--muted);margin:0 0 5px;text-transform:uppercase;letter-spacing:.05em}.notification-item{display:block;width:100%;text-align:left;padding:10px 6px;background:none;color:var(--text);border:0;border-bottom:1px solid var(--line);font-size:13px;overflow-wrap:anywhere}.notification-item:hover{background:var(--soft)}.notification-item small{display:block;margin-top:4px;overflow-wrap:anywhere}.notification-empty{font-size:13px;color:var(--muted);padding:8px 0}.sidebar .nav-link{gap:9px}@media(max-width:760px){.notification-panel{position:fixed;top:68px;left:10px;right:10px;width:auto;max-height:calc(100vh - 82px);max-height:calc(100dvh - 82px);padding:12px}.notification-panel-head{top:-12px}}`;
   document.head.appendChild(style);
 }
 async function refreshNotificationBadges() {
@@ -202,12 +202,7 @@ function startRealtime(userId) {
       scheduleRealtimeRefresh(payload);
     });
   }
-  realtimeChannel = channel.subscribe(status => {
-    const state = $('#connection-state');
-    if (!state) return;
-    if (status === 'SUBSCRIBED') state.textContent = 'Live updates on';
-    else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') state.textContent = 'Live updates reconnecting';
-  });
+  realtimeChannel = channel.subscribe(() => {});
   refreshNotificationBadges();
 }
 async function loadProfile() {
@@ -471,6 +466,38 @@ async function submitMessage(form) {
   form.reset(); openChat(activeChatUser);
 }
 
+function updateThemeButton() {
+  const button = $('#theme-toggle');
+  if (!button) return;
+  const dark = document.body.classList.contains('dark');
+  const label = dark ? 'Light theme' : 'Dark theme';
+  button.dataset.tooltip = label;
+  button.title = label;
+  button.setAttribute('aria-label', `Switch to ${label.toLowerCase()}`);
+  button.innerHTML = dark
+    ? '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4"></circle><path d="M12 2v2m0 16v2M4.93 4.93l1.42 1.42m11.3 11.3 1.42 1.42M2 12h2m16 0h2M4.93 19.07l1.42-1.42m11.3-11.3 1.42-1.42"></path></svg>'
+    : '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20.5 14.2A8.5 8.5 0 0 1 9.8 3.5 8.6 8.6 0 1 0 20.5 14.2Z"></path></svg>';
+}
+function toggleTheme() {
+  document.body.classList.toggle('dark');
+  localStorage.setItem('ps-theme', document.body.classList.contains('dark') ? 'dark' : 'light');
+  updateThemeButton();
+}
+function openMobileSidebar() {
+  $('#sidebar').classList.add('mobile-open');
+  $('#sidebar-backdrop').hidden = false;
+  $('#mobile-menu').setAttribute('aria-expanded', 'true');
+}
+function closeMobileSidebar() {
+  $('#sidebar').classList.remove('mobile-open');
+  $('#sidebar-backdrop').hidden = true;
+  $('#mobile-menu').setAttribute('aria-expanded', 'false');
+}
+function toggleMobileSidebar() {
+  if ($('#sidebar').classList.contains('mobile-open')) closeMobileSidebar();
+  else openMobileSidebar();
+}
+
 // Global click handling for the sidebar and dynamically rendered controls.
 document.addEventListener('click', async event => {
   if (event.target.closest('#notification-button')) {
@@ -492,8 +519,9 @@ document.addEventListener('click', async event => {
   if (nav) { event.preventDefault(); go(nav.dataset.view); return; }
   const tab = event.target.closest('[data-auth-tab]'); if (tab) { setAuthTab(tab.dataset.authTab); return; }
   if (event.target.closest('#collapse-sidebar')) { $('#sidebar').classList.toggle('collapsed'); return; }
-  if (event.target.closest('#mobile-menu')) { $('#sidebar').classList.toggle('mobile-open'); return; }
-  if (event.target.closest('#theme-toggle') || event.target.closest('#settings-theme')) { document.body.classList.toggle('dark'); localStorage.setItem('ps-theme', document.body.classList.contains('dark') ? 'dark' : 'light'); $('#theme-toggle').textContent = document.body.classList.contains('dark') ? 'Light theme' : 'Dark theme'; return; }
+  if (event.target.closest('#mobile-menu')) { toggleMobileSidebar(); return; }
+  if (event.target.closest('#close-mobile-sidebar') || event.target.closest('#sidebar-backdrop')) { closeMobileSidebar(); return; }
+  if (event.target.closest('#theme-toggle') || event.target.closest('#settings-theme')) { toggleTheme(); return; }
   if (event.target.closest('#logout-button')) { stopRealtime(); await supabase.auth.signOut(); currentUser = null; currentProfile = null; showAuth(); return; }
   if (event.target.closest('[data-action="retry"]')) { renderView(); return; }
   if (event.target.closest('[data-action="focus-post"]') || event.target.closest('[data-action="new-post"]')) { if (currentView !== 'posts') go('posts'); else $('#post-form textarea')?.focus(); return; }
@@ -528,7 +556,8 @@ $('#forgot-password').addEventListener('click', async () => {
   setAuthMessage(error ? error.message : 'Password reset email requested. Check your inbox.');
 });
 
-if (localStorage.getItem('ps-theme') === 'dark') { document.body.classList.add('dark'); $('#theme-toggle').textContent = 'Light theme'; }
+if (localStorage.getItem('ps-theme') === 'dark') document.body.classList.add('dark');
+updateThemeButton();
 if (!isConfigured) {
   showAuth();
   setAuthMessage('Supabase configuration is missing. Check js/config.js.', true);
