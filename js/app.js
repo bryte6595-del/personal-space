@@ -14,6 +14,7 @@ let currentUser = null;
 let currentProfile = null;
 let currentView = 'home';
 let activeChatUser = null;
+let chatProfiles = {};
 let viewedProfileId = null;
 let renderToken = 0;
 let realtimeChannel = null;
@@ -59,13 +60,15 @@ function pageHead(title, desc = '', action = '') { return `<div class="page-head
 function section(title, body) { return `<section class="section"><h3 class="section-title">${esc(title)}</h3>${body}</section>`; }
 function empty(message) { return `<p class="empty-state">${esc(message)}</p>`; }
 function field(label, name, value = '', type = 'text', extra = '') { return `<label>${esc(label)}<input name="${esc(name)}" type="${type}" value="${esc(value)}" ${extra}></label>`; }
-function go(view) {
-  currentView = view in titles ? view : 'home';
+async function go(view) {
+  const nextView = view in titles ? view : 'home';
+  if (nextView === 'messages' && currentView !== 'messages') activeChatUser = null;
+  currentView = nextView;
   if (location.hash !== '#' + currentView) history.replaceState(null, '', '#' + currentView);
   $$('.nav-link').forEach(a => a.classList.toggle('active', a.dataset.view === currentView));
   $('#breadcrumb').textContent = titles[currentView];
   closeMobileSidebar();
-  renderView();
+  await renderView();
 }
 function errorText(error) { return error?.message || 'Something went wrong. Please try again.'; }
 function stopRealtime() {
@@ -81,10 +84,14 @@ function scheduleRealtimeRefresh(payload) {
   let relevant = false;
   if (table === 'messages') {
     const otherId = row.sender_id === currentUser.id ? row.recipient_id : row.sender_id;
-    relevant = currentView === 'messages' && !!activeChatUser && otherId === activeChatUser;
-    if (relevant && payload.eventType === 'INSERT') {
+    if (currentView === 'messages' && payload.eventType === 'INSERT') {
       if (realtimeRefreshTimer) window.clearTimeout(realtimeRefreshTimer);
-      realtimeRefreshTimer = window.setTimeout(() => { realtimeRefreshTimer = null; if (currentUser) openChat(activeChatUser); }, 250);
+      realtimeRefreshTimer = window.setTimeout(() => {
+        realtimeRefreshTimer = null;
+        if (!currentUser || currentView !== 'messages') return;
+        if (activeChatUser === otherId) openChat(otherId);
+        else renderMessages();
+      }, 250);
     }
     return;
   }
@@ -295,29 +302,69 @@ async function renderFriends() {
     section('Followers and following', follows?.length ? `<ul class="plain-list">${follows.map(f => { const outgoing = f.follower_id === currentUser.id; const other = outgoing ? f.followed_id : f.follower_id; const followsBack = follows.some(x => x.follower_id === currentUser.id && x.followed_id === other); const followBack = !outgoing && !followsBack ? `<button class="button subtle" data-follow-user="${other}">Follow back</button>` : followsBack && !outgoing ? '<span class="muted">You follow back</span>' : ''; return `<li>${outgoing ? 'You follow' : 'Follows you'} <strong>${esc(byId[other]?.display_name || 'Member')}</strong> · @${esc(byId[other]?.username || 'unknown')} <button class="text-button" data-open-profile="${other}">View profile</button> ${followBack}</li>`; }).join('')}</ul>` : empty('No followers or followed accounts yet.'));
 }
 async function renderMessages() {
+  const keepChat = activeChatUser;
   const { data: friends, error } = await supabase.from('friendships').select('requester_id,addressee_id,status').eq('status', 'accepted').or(`requester_id.eq.${currentUser.id},addressee_id.eq.${currentUser.id}`);
   if (error) throw error;
-  const ids = [...new Set((friends || []).map(f => f.requester_id === currentUser.id ? f.addressee_id : f.requester_id))];
-  let people = [];
-  if (ids.length) { const r = await supabase.from('profiles').select('id,username,display_name').in('id', ids); if (r.error) throw r.error; people = r.data || []; }
-  const list = people.length ? people.map(p => `<button type="button" data-chat-user="${p.id}">${esc(p.display_name)} <span class="muted">@${esc(p.username)}</span></button>`).join('') : empty('You need an accepted friend connection before messaging.');
-  viewContainer.innerHTML = pageHead('Messages', 'Private text conversations with accepted friends.') +
-    `<div class="message-layout"><div class="conversation-list"><strong>Your friends</strong>${list}</div><div class="chat-panel"><div class="chat-messages" id="chat-messages">${empty('Choose a friend to open a conversation.')}</div><form id="message-form" class="chat-compose"><input name="body" placeholder="Write a message…" aria-label="Message" maxlength="5000" required disabled><button class="button primary" type="submit" disabled>Send</button></form></div></div>`;
+  const friendIds = [...new Set((friends || []).map(f => f.requester_id === currentUser.id ? f.addressee_id : f.requester_id))];
+  const [recentResult, unreadResult] = await Promise.all([
+    supabase.from('messages').select('id,sender_id,recipient_id,body,created_at').or(`sender_id.eq.${currentUser.id},recipient_id.eq.${currentUser.id}`).order('created_at', { ascending: false }).limit(250),
+    supabase.from('messages').select('id,sender_id').eq('recipient_id', currentUser.id).is('read_at', null).order('created_at', { ascending: false })
+  ]);
+  if (recentResult.error) throw recentResult.error;
+  if (unreadResult.error) throw unreadResult.error;
+  const latestByPerson = new Map();
+  for (const m of recentResult.data || []) {
+    const other = m.sender_id === currentUser.id ? m.recipient_id : m.sender_id;
+    if (!latestByPerson.has(other)) latestByPerson.set(other, m);
+  }
+  const unreadByPerson = {};
+  for (const m of unreadResult.data || []) unreadByPerson[m.sender_id] = (unreadByPerson[m.sender_id] || 0) + 1;
+  const ids = [...new Set([...friendIds, ...latestByPerson.keys()])];
+  chatProfiles = {};
+  if (ids.length) {
+    const r = await supabase.from('profiles').select('id,username,display_name').in('id', ids);
+    if (r.error) throw r.error;
+    chatProfiles = Object.fromEntries((r.data || []).map(p => [p.id, p]));
+  }
+  const people = ids.map(id => chatProfiles[id] || { id, username: 'unknown', display_name: 'Member' });
+  people.sort((a, b) => {
+    const ta = latestByPerson.get(a.id)?.created_at || '';
+    const tb = latestByPerson.get(b.id)?.created_at || '';
+    return tb.localeCompare(ta) || a.display_name.localeCompare(b.display_name);
+  });
+  const list = people.length ? people.map(p => {
+    const last = latestByPerson.get(p.id);
+    const unread = unreadByPerson[p.id] || 0;
+    const preview = last ? `${last.sender_id === currentUser.id ? 'You: ' : ''}${String(last.body || '').slice(0, 54)}` : 'No messages yet';
+    const when = last ? new Date(last.created_at).toLocaleString() : '';
+    return `<button type="button" class="conversation-item${keepChat === p.id ? ' active' : ''}" data-chat-user="${p.id}"><span class="conversation-topline"><strong>${esc(p.display_name)}</strong>${unread ? `<span class="conversation-unread">${unread > 99 ? '99+' : unread}</span>` : ''}</span><span class="muted conversation-handle">@${esc(p.username)}</span><span class="conversation-preview">${esc(preview)}</span>${when ? `<small class="conversation-time">${esc(when)}</small>` : ''}</button>`;
+  }).join('') : empty('You need an accepted friend connection before messaging.');
+  viewContainer.innerHTML = pageHead('Messages', 'Recent conversations appear first. Unread messages are marked.') +
+    `<div class="message-layout"><div class="conversation-list"><strong>Recent conversations</strong>${list}</div><div class="chat-panel"><div class="chat-messages" id="chat-messages">${empty('Choose a conversation to open it.')}</div><form id="message-form" class="chat-compose"><input name="body" placeholder="Write a message…" aria-label="Message" maxlength="5000" required disabled><button class="button primary" type="submit" disabled>Send</button></form></div></div>`;
+  const selected = people.find(p => p.id === keepChat) || people.find(p => latestByPerson.has(p.id));
   activeChatUser = null;
+  if (selected) await openChat(selected.id);
 }
 async function openChat(userId) {
   activeChatUser = userId;
   const box = $('#chat-messages');
   const form = $('#message-form');
   if (!box || !form) return;
+  $$('.conversation-item').forEach(button => button.classList.toggle('active', button.dataset.chatUser === userId));
   form.querySelector('input').disabled = false;
   form.querySelector('button').disabled = false;
   box.innerHTML = '<p class="muted">Loading conversation…</p>';
+  if (!chatProfiles[userId]) {
+    const profileResult = await supabase.from('profiles').select('id,username,display_name').eq('id', userId).maybeSingle();
+    if (profileResult.data) chatProfiles[userId] = profileResult.data;
+  }
+  const otherName = chatProfiles[userId]?.display_name || 'Member';
   const { data, error } = await supabase.from('messages').select('*').or(`and(sender_id.eq.${currentUser.id},recipient_id.eq.${userId}),and(sender_id.eq.${userId},recipient_id.eq.${currentUser.id})`).order('created_at', { ascending: true });
   if (error) { box.innerHTML = `<p class="error-text">${esc(error.message)}</p>`; return; }
-  box.innerHTML = data.length ? data.map(m => `<p class="chat-line"><strong>${m.sender_id === currentUser.id ? 'You' : 'Friend'}:</strong> ${esc(m.body)}<span class="post-meta">${new Date(m.created_at).toLocaleString()}</span></p>`).join('') : empty('No messages yet. Start the conversation.');
+  box.innerHTML = data.length ? data.map(m => `<p class="chat-line"><strong>${m.sender_id === currentUser.id ? 'You' : esc(otherName)}:</strong> ${esc(m.body)}<span class="post-meta">${new Date(m.created_at).toLocaleString()}</span></p>`).join('') : empty('No messages yet. Start the conversation.');
   box.scrollTop = box.scrollHeight;
   await supabase.from('messages').update({ read_at: new Date().toISOString() }).eq('sender_id', userId).eq('recipient_id', currentUser.id).is('read_at', null);
+  $(`.conversation-item[data-chat-user=\"${userId}\"] .conversation-unread`)?.remove();
   refreshNotificationBadges();
 }
 async function renderMedia(kind) {
@@ -510,7 +557,7 @@ document.addEventListener('click', async event => {
   }
   if (event.target.closest('#notification-close')) { notificationPanelOpen = false; $('#notification-panel').hidden = true; $('#notification-button').setAttribute('aria-expanded','false'); return; }
   const notificationChat = event.target.closest('[data-notification-chat]');
-  if (notificationChat) { $('#notification-panel').hidden = true; notificationPanelOpen = false; go('messages'); await openChat(notificationChat.dataset.notificationChat); return; }
+  if (notificationChat) { $('#notification-panel').hidden = true; notificationPanelOpen = false; await go('messages'); await openChat(notificationChat.dataset.notificationChat); return; }
   if (event.target.closest('[data-notification-friends]')) { $('#notification-panel').hidden = true; notificationPanelOpen = false; go('friends'); return; }
   const notificationPost = event.target.closest('[data-notification-post]');
   if (notificationPost) { setPostSeenAt(notificationPost.dataset.postCreated || new Date().toISOString()); $('#notification-panel').hidden = true; notificationPanelOpen = false; viewedProfileId = notificationPost.dataset.notificationPost; go('public-profile'); return; }
