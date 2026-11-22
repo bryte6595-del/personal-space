@@ -6,13 +6,15 @@ const $$ = (s, root = document) => [...root.querySelectorAll(s)];
 const authScreen = $('#auth-screen');
 const app = $('#app');
 const viewContainer = $('#view-container');
-const titles = { home:'Home', profile:'My profile', posts:'Posts', friends:'Friends & followers', messages:'Messages', images:'Images', videos:'Videos', audio:'Audio', projects:'Projects & games', movies:'Movies', recommendations:'Recommendations', settings:'Settings' };
+const titles = { home:'Home', profile:'My profile', 'public-profile':'Member profile', posts:'Posts', friends:'Friends & followers', messages:'Messages', images:'Images', videos:'Videos', audio:'Audio', projects:'Projects & games', movies:'Movies', recommendations:'Recommendations', settings:'Settings' };
 const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+function safeHttpUrl(value) { try { const url = new URL(String(value), location.origin); return ['http:', 'https:'].includes(url.protocol) ? url.href : ''; } catch { return ''; } }
 let supabase;
 let currentUser = null;
 let currentProfile = null;
 let currentView = 'home';
 let activeChatUser = null;
+let viewedProfileId = null;
 let renderToken = 0;
 
 function toast(message) {
@@ -76,7 +78,7 @@ async function renderView() {
   try {
     await loadProfile();
     if (token !== renderToken) return;
-    const pages = { home: renderHome, profile: renderProfile, posts: renderPosts, friends: renderFriends, messages: renderMessages, images: () => renderMedia('image'), videos: () => renderMedia('video'), audio: () => renderMedia('audio'), projects: () => renderCollection('projects'), movies: () => renderCollection('movies'), recommendations: () => renderCollection('recommendations'), settings: renderSettings };
+    const pages = { home: renderHome, profile: renderProfile, 'public-profile': renderPublicProfile, posts: renderPosts, friends: renderFriends, messages: renderMessages, images: () => renderMedia('image'), videos: () => renderMedia('video'), audio: () => renderMedia('audio'), projects: () => renderCollection('projects'), movies: () => renderCollection('movies'), recommendations: () => renderCollection('recommendations'), settings: renderSettings };
     await (pages[currentView] || renderHome)();
   } catch (error) {
     if (token === renderToken) viewContainer.innerHTML = pageHead(titles[currentView], 'We could not load this section.') + `<p class="error-text">${esc(errorText(error))}</p><button class="button" data-action="retry">Try again</button>`;
@@ -100,6 +102,35 @@ async function renderProfile() {
     `<div class="profile-header"><div class="avatar">${esc(initials(p.display_name))}</div><div><h2>${esc(p.display_name)}</h2><p class="muted">@${esc(p.username)}</p><p>${esc(p.bio || 'No biography added yet.')}</p></div></div>` +
     `<form id="profile-form" class="content-form"><h3>Edit profile</h3>${field('Display name','display_name',p.display_name,'text','maxlength="60" required')}${field('Username','username',p.username,'text','minlength="3" maxlength="24" pattern="[A-Za-z0-9_]+" required')}<label>Biography<textarea name="bio" maxlength="300">${esc(p.bio || '')}</textarea></label>${field('Website link','website',p.website || '', 'url','placeholder="https://"')}<label>Profile visibility<select name="profile_visibility"><option value="public" ${p.profile_visibility === 'public' ? 'selected' : ''}>Public</option><option value="friends" ${p.profile_visibility === 'friends' ? 'selected' : ''}>Friends only</option></select></label><button class="button primary" type="submit">Save profile</button></form>`;
 }
+async function renderPublicProfile() {
+  if (!viewedProfileId || viewedProfileId === currentUser.id) { go('profile'); return; }
+  const { data: person, error } = await supabase.from('profiles').select('id,username,display_name,bio,avatar_url,cover_url,website,profile_visibility,created_at').eq('id', viewedProfileId).maybeSingle();
+  if (error) throw error;
+  if (!person) {
+    viewContainer.innerHTML = pageHead('Profile unavailable', 'This profile may be private or no longer available.') + '<button class="button" data-view="friends">Back to people</button>';
+    return;
+  }
+  const [{ data: posts, error: postError }, { data: friendship }, { data: following }] = await Promise.all([
+    supabase.from('posts').select('id,body,visibility,created_at').eq('user_id', person.id).order('created_at', { ascending: false }).limit(50),
+    supabase.from('friendships').select('id,status,requester_id,addressee_id').or(`and(requester_id.eq.${currentUser.id},addressee_id.eq.${person.id}),and(requester_id.eq.${person.id},addressee_id.eq.${currentUser.id})`).maybeSingle(),
+    supabase.from('follows').select('follower_id').eq('follower_id', currentUser.id).eq('followed_id', person.id).maybeSingle()
+  ]);
+  if (postError) throw postError;
+  const avatarUrl = safeHttpUrl(person.avatar_url);
+  const coverUrl = safeHttpUrl(person.cover_url);
+  const avatar = avatarUrl ? `<img src="${esc(avatarUrl)}" alt="${esc(person.display_name)}" style="width:100%;height:100%;object-fit:cover">` : esc(initials(person.display_name));
+  const cover = coverUrl ? `<img src="${esc(coverUrl)}" alt="${esc(person.display_name)} cover" style="width:100%;max-height:190px;object-fit:cover;border:1px solid var(--line);margin-bottom:16px">` : '';
+  const friendshipAction = friendship ? `<span class="muted">Friendship: ${esc(friendship.status)}</span>` : `<button class="button" data-add-friend="${person.id}">Send friend request</button>`;
+  const followAction = following ? '<span class="muted">You follow this person</span>' : `<button class="button" data-follow-user="${person.id}">Follow</button>`;
+  const websiteUrl = safeHttpUrl(person.website);
+  const website = websiteUrl ? `<p><a href="${esc(websiteUrl)}" target="_blank" rel="noopener noreferrer">${esc(person.website)}</a></p>` : '';
+  const postRows = posts?.length ? `<ul class="plain-list">${posts.map(post => `<li><p class="post-body">${esc(post.body)}</p><span class="post-meta">${new Date(post.created_at).toLocaleString()} · ${esc(post.visibility)}</span></li>`).join('')}</ul>` : empty('No posts are available to view.');
+  const joined = person.created_at ? `Member since ${new Date(person.created_at).toLocaleDateString()}` : '';
+  viewContainer.innerHTML = pageHead('Member profile', `A look at what ${person.display_name} has chosen to share.`, '<button class="button" data-view="friends">Back to people</button>') + cover +
+    `<div class="profile-header"><div class="avatar">${avatar}</div><div><h2>${esc(person.display_name)}</h2><p class="muted">@${esc(person.username)}</p><p>${esc(person.bio || 'No biography added.')}</p>${website}<p class="post-meta">${esc(joined)}</p><div class="inline-actions">${friendshipAction}${followAction}</div></div></div>` +
+    section('Publications', postRows);
+}
+
 async function renderPosts() {
   const { data: posts, error } = await supabase.from('posts').select('*').eq('user_id', currentUser.id).order('created_at', { ascending: false });
   if (error) throw error;
@@ -116,11 +147,11 @@ async function renderFriends() {
   let people = [];
   if (otherIds.length) { const r = await supabase.from('profiles').select('id,username,display_name').in('id', otherIds); if (r.error) throw r.error; people = r.data || []; }
   const byId = Object.fromEntries(people.map(p => [p.id, p]));
-  const linkRows = links.length ? links.map(f => { const incoming = f.addressee_id === currentUser.id; const other = incoming ? f.requester_id : f.addressee_id; return `<li><strong>${esc(byId[other]?.display_name || 'Member')}</strong> · @${esc(byId[other]?.username || 'unknown')} <span class="muted">${incoming ? 'Incoming' : 'Outgoing'} ${esc(f.status)}</span> ${f.status === 'pending' && incoming ? `<button class="button" data-accept-friend="${f.id}">Accept</button>` : ''}</li>`; }).join('') : '';
+  const linkRows = links.length ? links.map(f => { const incoming = f.addressee_id === currentUser.id; const other = incoming ? f.requester_id : f.addressee_id; return `<li><strong>${esc(byId[other]?.display_name || 'Member')}</strong> · @${esc(byId[other]?.username || 'unknown')} <button class="text-button" data-open-profile="${other}">View profile</button> <span class="muted">${incoming ? 'Incoming' : 'Outgoing'} ${esc(f.status)}</span> ${f.status === 'pending' && incoming ? `<button class="button" data-accept-friend="${f.id}">Accept</button>` : ''}</li>`; }).join('') : '';
   viewContainer.innerHTML = pageHead('Friends & followers', 'Find people and manage connection requests.') +
     `<form id="user-search" class="content-form"><h3>Find someone</h3><label>Exact username<input name="username" placeholder="username" required></label><button class="button" type="submit">Search</button><div id="search-results"></div></form>` +
     section('Friend requests and connections', linkRows ? `<ul class="plain-list">${linkRows}</ul>` : empty('No friend requests or connections yet.')) +
-    section('Followers and following', follows?.length ? `<ul class="plain-list">${follows.map(f => { const outgoing = f.follower_id === currentUser.id; const other = outgoing ? f.followed_id : f.follower_id; return `<li>${outgoing ? 'You follow' : 'Follows you'} <strong>${esc(byId[other]?.display_name || 'Member')}</strong> · @${esc(byId[other]?.username || 'unknown')}</li>`; }).join('')}</ul>` : empty('No followers or followed accounts yet.'));
+    section('Followers and following', follows?.length ? `<ul class="plain-list">${follows.map(f => { const outgoing = f.follower_id === currentUser.id; const other = outgoing ? f.followed_id : f.follower_id; const followsBack = follows.some(x => x.follower_id === currentUser.id && x.followed_id === other); const followBack = !outgoing && !followsBack ? `<button class="button subtle" data-follow-user="${other}">Follow back</button>` : followsBack && !outgoing ? '<span class="muted">You follow back</span>' : ''; return `<li>${outgoing ? 'You follow' : 'Follows you'} <strong>${esc(byId[other]?.display_name || 'Member')}</strong> · @${esc(byId[other]?.username || 'unknown')} <button class="text-button" data-open-profile="${other}">View profile</button> ${followBack}</li>`; }).join('')}</ul>` : empty('No followers or followed accounts yet.'));
 }
 async function renderMessages() {
   const { data: friends, error } = await supabase.from('friendships').select('requester_id,addressee_id,status').eq('status', 'accepted').or(`requester_id.eq.${currentUser.id},addressee_id.eq.${currentUser.id}`);
@@ -248,17 +279,17 @@ async function searchUser(form) {
   const { data: existing } = await supabase.from('friendships').select('id,status,requester_id,addressee_id').or(`and(requester_id.eq.${currentUser.id},addressee_id.eq.${data.id}),and(requester_id.eq.${data.id},addressee_id.eq.${currentUser.id})`).maybeSingle();
   const action = existing ? `<span class="muted">Friendship: ${esc(existing.status)}</span>` : `<button class="button" data-add-friend="${data.id}">Send friend request</button>`;
   const { data: following } = await supabase.from('follows').select('follower_id').eq('follower_id', currentUser.id).eq('followed_id', data.id).maybeSingle();
-  box.innerHTML = `<p><strong>${esc(data.display_name)}</strong> · @${esc(data.username)} ${action} ${following ? '<span class="muted">You follow this person</span>' : `<button class="button" data-follow-user="${data.id}">Follow</button>`}</p>`;
+  box.innerHTML = `<p><strong>${esc(data.display_name)}</strong> · @${esc(data.username)} <button class="text-button" data-open-profile="${data.id}">View profile</button> ${action} ${following ? '<span class="muted">You follow this person</span>' : `<button class="button" data-follow-user="${data.id}">Follow</button>`}</p>`;
 }
 async function sendFriendRequest(id) {
   const { error } = await supabase.from('friendships').insert({ requester_id: currentUser.id, addressee_id: id, status: 'pending' });
   toast(error ? error.message : 'Friend request sent.');
-  if (!error) renderFriends();
+  if (!error) renderView();
 }
 async function acceptFriend(id) {
   const { error } = await supabase.from('friendships').update({ status: 'accepted' }).eq('id', id).eq('addressee_id', currentUser.id);
   toast(error ? error.message : 'Friend request accepted.');
-  if (!error) renderFriends();
+  if (!error) renderView();
 }
 async function submitCollection(form) {
   const table = currentView;
@@ -305,9 +336,10 @@ document.addEventListener('click', async event => {
   if (event.target.closest('[data-action="retry"]')) { renderView(); return; }
   if (event.target.closest('[data-action="focus-post"]') || event.target.closest('[data-action="new-post"]')) { if (currentView !== 'posts') go('posts'); else $('#post-form textarea')?.focus(); return; }
   const delPost = event.target.closest('[data-delete-post]'); if (delPost) { if (!confirm('Delete this post?')) return; const { error } = await supabase.from('posts').delete().eq('id', delPost.dataset.deletePost).eq('user_id', currentUser.id); toast(error ? error.message : 'Post deleted.'); if (!error) renderPosts(); return; }
+  const openProfile = event.target.closest('[data-open-profile]'); if (openProfile) { viewedProfileId = openProfile.dataset.openProfile; go('public-profile'); return; }
   const add = event.target.closest('[data-add-friend]'); if (add) { await sendFriendRequest(add.dataset.addFriend); return; }
   const accept = event.target.closest('[data-accept-friend]'); if (accept) { await acceptFriend(accept.dataset.acceptFriend); return; }
-  const follow = event.target.closest('[data-follow-user]'); if (follow) { const { error } = await supabase.from('follows').insert({ follower_id: currentUser.id, followed_id: follow.dataset.followUser }); toast(error ? error.message : 'You are now following this person.'); if (!error) renderFriends(); return; }
+  const follow = event.target.closest('[data-follow-user]'); if (follow) { const { error } = await supabase.from('follows').insert({ follower_id: currentUser.id, followed_id: follow.dataset.followUser }); toast(error ? error.message : 'You are now following this person.'); if (!error) renderView(); return; }
   const chat = event.target.closest('[data-chat-user]'); if (chat) { await openChat(chat.dataset.chatUser); return; }
   const delMedia = event.target.closest('[data-delete-media]'); if (delMedia) { if (!confirm('Delete this media item?')) return; const path = delMedia.dataset.storagePath; if (path) { const r = await supabase.storage.from('user-media').remove([path]); if (r.error) return toast(r.error.message); } const r = await supabase.from('media_items').delete().eq('id', delMedia.dataset.deleteMedia).eq('user_id', currentUser.id); toast(r.error ? r.error.message : 'Media deleted.'); if (!r.error) renderView(); return; }
   const delEntry = event.target.closest('[data-delete-entry]'); if (delEntry) { if (!confirm('Delete this entry?')) return; const { error } = await supabase.from(delEntry.dataset.table).delete().eq('id', delEntry.dataset.deleteEntry).eq('user_id', currentUser.id); toast(error ? error.message : 'Entry deleted.'); if (!error) renderCollection(delEntry.dataset.table); return; }
