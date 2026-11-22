@@ -246,9 +246,14 @@ async function renderHome() {
 }
 async function renderProfile() {
   const p = currentProfile;
-  viewContainer.innerHTML = pageHead('My profile', 'Edit the information attached to your account.') +
-    `<div class="profile-header"><div class="avatar">${esc(initials(p.display_name))}</div><div><h2>${esc(p.display_name)}</h2><p class="muted">@${esc(p.username)}</p><p>${esc(p.bio || 'No biography added yet.')}</p></div></div>` +
-    `<form id="profile-form" class="content-form"><h3>Edit profile</h3>${field('Display name','display_name',p.display_name,'text','maxlength="60" required')}${field('Username','username',p.username,'text','minlength="3" maxlength="24" pattern="[A-Za-z0-9_]+" required')}<label>Biography<textarea name="bio" maxlength="300">${esc(p.bio || '')}</textarea></label>${field('Website link','website',p.website || '', 'url','placeholder="https://"')}<label>Profile visibility<select name="profile_visibility"><option value="public" ${p.profile_visibility === 'public' ? 'selected' : ''}>Public</option><option value="friends" ${p.profile_visibility === 'friends' ? 'selected' : ''}>Friends only</option></select></label><button class="button primary" type="submit">Save profile</button></form>`;
+  const avatarUrl = safeHttpUrl(p.avatar_url);
+  const coverUrl = safeHttpUrl(p.cover_url);
+  const avatar = avatarUrl ? `<img src="${esc(avatarUrl)}" alt="Profile picture">` : esc(initials(p.display_name));
+  const cover = coverUrl ? `<img class="profile-cover-preview" src="${esc(coverUrl)}" alt="Profile banner">` : '<div class="profile-cover-empty">No banner added yet</div>';
+  viewContainer.innerHTML = pageHead('My profile', 'Edit your profile and choose the images people see when they visit your space.') +
+    `<div class="profile-cover-wrap">${cover}</div><div class="profile-header"><div class="avatar">${avatar}</div><div><h2>${esc(p.display_name)}</h2><p class="muted">@${esc(p.username)}</p><p>${esc(p.bio || 'No biography added yet.')}</p></div></div>` +
+    `<div class="profile-image-controls"><form id="avatar-upload-form" class="content-form profile-upload-form"><h3>Profile picture</h3><p class="muted">Choose a square image if possible. JPG, PNG, WEBP or GIF, up to 10 MB.</p><label>Choose profile picture<input name="file" type="file" accept="image/jpeg,image/png,image/webp,image/gif" required></label><button class="button" type="submit">Upload profile picture</button></form><form id="cover-upload-form" class="content-form profile-upload-form"><h3>Profile banner</h3><p class="muted">A wide image works best. JPG, PNG, WEBP or GIF, up to 10 MB.</p><label>Choose banner image<input name="file" type="file" accept="image/jpeg,image/png,image/webp,image/gif" required></label><button class="button" type="submit">Upload banner</button></form></div>` +
+    `<form id="profile-form" class="content-form"><h3>Edit profile details</h3>${field('Display name','display_name',p.display_name,'text','maxlength="60" required')}${field('Username','username',p.username,'text','minlength="3" maxlength="24" pattern="[A-Za-z0-9_]+" required')}<label>Biography<textarea name="bio" maxlength="300">${esc(p.bio || '')}</textarea></label>${field('Website link','website',p.website || '', 'url','placeholder="https://"')}<label>Profile visibility<select name="profile_visibility"><option value="public" ${p.profile_visibility === 'public' ? 'selected' : ''}>Public</option><option value="friends" ${p.profile_visibility === 'friends' ? 'selected' : ''}>Friends only</option></select></label><button class="button primary" type="submit">Save profile</button></form>`;
 }
 async function renderPublicProfile() {
   if (!viewedProfileId || viewedProfileId === currentUser.id) { go('profile'); return; }
@@ -453,6 +458,27 @@ async function submitProfile(form) {
   if (error) return toast(error.message);
   await loadProfile(); toast('Profile saved.'); renderProfile();
 }
+async function submitProfileImage(form, fieldName) {
+  const file = new FormData(form).get('file');
+  if (!file || !file.size) return toast('Choose an image first.');
+  if (!file.type.startsWith('image/')) return toast('Please choose an image file.');
+  if (file.size > 10 * 1024 * 1024) return toast('Images must be 10 MB or smaller.');
+  const allowed = ['image/jpeg','image/png','image/webp','image/gif'];
+  if (!allowed.includes(file.type)) return toast('Use JPG, PNG, WEBP or GIF.');
+  const extension = ({'image/jpeg':'jpg','image/png':'png','image/webp':'webp','image/gif':'gif'})[file.type];
+  const path = `${currentUser.id}/${fieldName}-${Date.now()}-${crypto.randomUUID()}.${extension}`;
+  setBusy(form, true, 'Uploading…');
+  try {
+    const upload = await supabase.storage.from('profile-media').upload(path, file, { upsert: false, contentType: file.type, cacheControl: '3600' });
+    if (upload.error) throw upload.error;
+    const { data } = supabase.storage.from('profile-media').getPublicUrl(path);
+    const { error } = await supabase.from('profiles').update({ [fieldName]: data.publicUrl }).eq('id', currentUser.id);
+    if (error) { await supabase.storage.from('profile-media').remove([path]); throw error; }
+    await loadProfile();
+    toast(fieldName === 'avatar_url' ? 'Profile picture updated.' : 'Profile banner updated.');
+    renderProfile();
+  } finally { setBusy(form, false); }
+}
 async function submitPost(form) {
   const fd = new FormData(form);
   const { error } = await supabase.from('posts').insert({ user_id: currentUser.id, body: String(fd.get('body')).trim(), visibility: fd.get('visibility') });
@@ -589,6 +615,8 @@ document.addEventListener('submit', async event => {
   event.preventDefault();
   try {
     if (form.id === 'profile-form') await submitProfile(form);
+    else if (form.id === 'avatar-upload-form') await submitProfileImage(form, 'avatar_url');
+    else if (form.id === 'cover-upload-form') await submitProfileImage(form, 'cover_url');
     else if (form.id === 'post-form') await submitPost(form);
     else if (form.id === 'user-search') await searchUser(form);
     else if (form.id === 'collection-form') await submitCollection(form);
