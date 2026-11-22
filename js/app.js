@@ -191,7 +191,7 @@ function renderSettings() {
 
 async function handleAuth(event, kind) {
   event.preventDefault();
-  const formEl = event.currentTarget;
+  const formEl = event.target;
   const fd = new FormData(formEl);
   const email = String(fd.get('email') || '').trim();
   const password = String(fd.get('password') || '');
