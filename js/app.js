@@ -16,6 +16,8 @@ let currentView = 'home';
 let activeChatUser = null;
 let viewedProfileId = null;
 let renderToken = 0;
+let realtimeChannel = null;
+let realtimeRefreshTimer = null;
 
 function toast(message) {
   const el = $('#toast');
@@ -64,6 +66,45 @@ function go(view) {
   renderView();
 }
 function errorText(error) { return error?.message || 'Something went wrong. Please try again.'; }
+function stopRealtime() {
+  if (realtimeRefreshTimer) window.clearTimeout(realtimeRefreshTimer);
+  realtimeRefreshTimer = null;
+  if (realtimeChannel) supabase.removeChannel(realtimeChannel);
+  realtimeChannel = null;
+}
+function scheduleRealtimeRefresh(payload) {
+  if (!currentUser) return;
+  if (payload?.table === 'messages' && currentView === 'messages' && activeChatUser) {
+    const row = payload.new || payload.old || {};
+    if (row.sender_id !== activeChatUser && row.recipient_id !== activeChatUser) return;
+  }
+  if (realtimeRefreshTimer) window.clearTimeout(realtimeRefreshTimer);
+  realtimeRefreshTimer = window.setTimeout(() => {
+    realtimeRefreshTimer = null;
+    if (!currentUser) return;
+    if (currentView === 'messages' && activeChatUser) openChat(activeChatUser);
+    else renderView();
+  }, 450);
+}
+function startRealtime(userId) {
+  if (!supabase || !userId) return;
+  stopRealtime();
+  const tables = ['profiles','posts','friendships','follows','messages','media_items','projects','movies','recommendations'];
+  let channel = supabase.channel(`personal-space-live-${userId}`);
+  for (const table of tables) {
+    channel = channel.on('postgres_changes', { event: '*', schema: 'public', table }, payload => {
+      // Message read receipts are frequent updates; only new messages need a refresh.
+      if (payload.table === 'messages' && payload.eventType !== 'INSERT') return;
+      scheduleRealtimeRefresh(payload);
+    });
+  }
+  realtimeChannel = channel.subscribe(status => {
+    const state = $('#connection-state');
+    if (!state) return;
+    if (status === 'SUBSCRIBED') state.textContent = 'Live updates on';
+    else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') state.textContent = 'Live updates reconnecting';
+  });
+}
 async function loadProfile() {
   const { data, error } = await supabase.from('profiles').select('*').eq('id', currentUser.id).maybeSingle();
   if (error) throw error;
@@ -332,7 +373,7 @@ document.addEventListener('click', async event => {
   if (event.target.closest('#collapse-sidebar')) { $('#sidebar').classList.toggle('collapsed'); return; }
   if (event.target.closest('#mobile-menu')) { $('#sidebar').classList.toggle('mobile-open'); return; }
   if (event.target.closest('#theme-toggle') || event.target.closest('#settings-theme')) { document.body.classList.toggle('dark'); localStorage.setItem('ps-theme', document.body.classList.contains('dark') ? 'dark' : 'light'); $('#theme-toggle').textContent = document.body.classList.contains('dark') ? 'Light theme' : 'Dark theme'; return; }
-  if (event.target.closest('#logout-button')) { await supabase.auth.signOut(); currentUser = null; currentProfile = null; showAuth(); return; }
+  if (event.target.closest('#logout-button')) { stopRealtime(); await supabase.auth.signOut(); currentUser = null; currentProfile = null; showAuth(); return; }
   if (event.target.closest('[data-action="retry"]')) { renderView(); return; }
   if (event.target.closest('[data-action="focus-post"]') || event.target.closest('[data-action="new-post"]')) { if (currentView !== 'posts') go('posts'); else $('#post-form textarea')?.focus(); return; }
   const delPost = event.target.closest('[data-delete-post]'); if (delPost) { if (!confirm('Delete this post?')) return; const { error } = await supabase.from('posts').delete().eq('id', delPost.dataset.deletePost).eq('user_id', currentUser.id); toast(error ? error.message : 'Post deleted.'); if (!error) renderPosts(); return; }
@@ -374,7 +415,8 @@ if (!isConfigured) {
   supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, { auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true } });
   supabase.auth.onAuthStateChange((_event, session) => {
     currentUser = session?.user || null;
-    if (!currentUser) { currentProfile = null; showAuth(); return; }
+    if (!currentUser) { stopRealtime(); currentProfile = null; showAuth(); return; }
+    startRealtime(currentUser.id);
     showApp();
     // Avoid awaiting Supabase calls inside its auth callback.
     Promise.resolve().then(() => { if (currentUser?.id === session.user.id) go(location.hash.slice(1) || 'home'); });
@@ -382,6 +424,6 @@ if (!isConfigured) {
   const { data, error } = await supabase.auth.getSession();
   if (error) setAuthMessage(error.message, true);
   currentUser = data.session?.user || null;
-  if (currentUser) { showApp(); await renderView(); }
+  if (currentUser) { startRealtime(currentUser.id); showApp(); await renderView(); }
   else showAuth();
 }
