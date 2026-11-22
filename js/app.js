@@ -18,6 +18,8 @@ let viewedProfileId = null;
 let renderToken = 0;
 let realtimeChannel = null;
 let realtimeRefreshTimer = null;
+let notificationPanelOpen = false;
+let notificationRefreshTimer = null;
 
 function toast(message) {
   const el = $('#toast');
@@ -73,28 +75,130 @@ function stopRealtime() {
   realtimeChannel = null;
 }
 function scheduleRealtimeRefresh(payload) {
-  if (!currentUser) return;
-  if (payload?.table === 'messages' && currentView === 'messages' && activeChatUser) {
-    const row = payload.new || payload.old || {};
-    if (row.sender_id !== activeChatUser && row.recipient_id !== activeChatUser) return;
+  if (!currentUser || !payload) return;
+  const row = payload.new || payload.old || {};
+  const table = payload.table;
+  let relevant = false;
+  if (table === 'messages') {
+    const otherId = row.sender_id === currentUser.id ? row.recipient_id : row.sender_id;
+    relevant = currentView === 'messages' && !!activeChatUser && otherId === activeChatUser;
+    if (relevant && payload.eventType === 'INSERT') {
+      if (realtimeRefreshTimer) window.clearTimeout(realtimeRefreshTimer);
+      realtimeRefreshTimer = window.setTimeout(() => { realtimeRefreshTimer = null; if (currentUser) openChat(activeChatUser); }, 250);
+    }
+    return;
   }
+  if (table === 'posts') relevant = (currentView === 'home') || (currentView === 'posts' && row.user_id === currentUser.id) || (currentView === 'public-profile' && row.user_id === viewedProfileId);
+  else if (table === 'friendships' || table === 'follows') relevant = currentView === 'friends' || currentView === 'public-profile';
+  else if (table === 'profiles') relevant = (currentView === 'profile' && row.id === currentUser.id) || (currentView === 'public-profile' && row.id === viewedProfileId);
+  else if (table === 'media_items') relevant = (row.user_id === currentUser.id) && ['images','videos','audio'].includes(currentView);
+  else if (['projects','movies','recommendations'].includes(table)) relevant = currentView === table && row.user_id === currentUser.id;
+  if (!relevant) return;
   if (realtimeRefreshTimer) window.clearTimeout(realtimeRefreshTimer);
-  realtimeRefreshTimer = window.setTimeout(() => {
-    realtimeRefreshTimer = null;
-    if (!currentUser) return;
-    if (currentView === 'messages' && activeChatUser) openChat(activeChatUser);
-    else renderView();
-  }, 450);
+  realtimeRefreshTimer = window.setTimeout(() => { realtimeRefreshTimer = null; if (currentUser) renderView(); }, 450);
+}
+function postSeenKey() { return `ps-posts-seen-${currentUser?.id || 'guest'}`; }
+function getPostSeenAt() {
+  let value = localStorage.getItem(postSeenKey());
+  if (!value) { value = new Date().toISOString(); localStorage.setItem(postSeenKey(), value); }
+  return value;
+}
+function setPostSeenAt(value = new Date().toISOString()) { localStorage.setItem(postSeenKey(), value); }
+function initNotificationUI() {
+  if ($('#notification-button')) return;
+  const actions = $('.topbar-actions');
+  if (!actions) return;
+  actions.insertAdjacentHTML('afterbegin', `<div class="notification-wrap"><button id="notification-button" class="button subtle notification-button" type="button" aria-expanded="false">♢ Notifications <span id="notification-badge" class="notification-badge" hidden>0</span></button><div id="notification-panel" class="notification-panel" hidden><div class="notification-panel-head"><strong>Notifications</strong><button type="button" id="notification-close" class="text-button">Close</button></div><div id="notification-content"><p class="muted">Loading…</p></div></div></div>`);
+  const style = document.createElement('style');
+  style.textContent = `.notification-wrap{position:relative}.notification-button{white-space:nowrap}.notification-badge,.nav-count{display:inline-flex;align-items:center;justify-content:center;min-width:18px;height:18px;padding:0 5px;border-radius:10px;background:var(--danger);color:white;font-size:11px;font-weight:700;margin-left:5px}.nav-count{margin-left:auto}.notification-panel{position:absolute;right:0;top:calc(100% + 9px);width:min(360px,calc(100vw - 28px));max-height:min(70vh,520px);overflow:auto;background:var(--paper);border:1px solid var(--line);z-index:30;padding:12px;box-shadow:0 5px 18px #0002}.notification-panel-head{display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid var(--line);padding-bottom:9px;margin-bottom:8px}.notification-group{margin:12px 0}.notification-group h4{font-size:12px;color:var(--muted);margin:0 0 5px;text-transform:uppercase;letter-spacing:.05em}.notification-item{display:block;width:100%;text-align:left;padding:9px 4px;background:none;color:var(--text);border:0;border-bottom:1px solid var(--line);font-size:13px}.notification-item:hover{background:var(--soft)}.notification-item small{display:block;margin-top:3px}.notification-empty{font-size:13px;color:var(--muted);padding:8px 0}.sidebar .nav-link{gap:9px}`;
+  document.head.appendChild(style);
+}
+async function refreshNotificationBadges() {
+  if (!currentUser || !supabase) return;
+  try {
+    const [messages, requests, follows] = await Promise.all([
+      supabase.from('messages').select('id', { count:'exact', head:true }).eq('recipient_id', currentUser.id).is('read_at', null),
+      supabase.from('friendships').select('id', { count:'exact', head:true }).eq('addressee_id', currentUser.id).eq('status', 'pending'),
+      supabase.from('follows').select('followed_id').eq('follower_id', currentUser.id)
+    ]);
+    const unread = messages.count || 0;
+    const pending = requests.count || 0;
+    let newPosts = 0;
+    const followedIds = [...new Set((follows.data || []).map(x => x.followed_id))];
+    if (followedIds.length) {
+      const postCount = await supabase.from('posts').select('id', { count:'exact', head:true }).in('user_id', followedIds).gt('created_at', getPostSeenAt());
+      newPosts = postCount.count || 0;
+    }
+    const badge = $('#notification-badge');
+    if (badge) { const total = unread + pending + newPosts; badge.textContent = total > 99 ? '99+' : String(total); badge.hidden = total === 0; }
+    const setNavBadge = (view, count) => {
+      const link = $(`.nav-link[data-view="${view}"]`);
+      if (!link) return;
+      let el = $('.nav-count', link);
+      if (!el) { el = document.createElement('span'); el.className = 'nav-count'; link.appendChild(el); }
+      el.textContent = count > 99 ? '99+' : String(count);
+      el.hidden = count === 0;
+    };
+    setNavBadge('messages', unread);
+    setNavBadge('friends', pending);
+  } catch (error) { console.warn('Could not refresh notification counts:', error); }
+}
+async function loadNotificationPanel() {
+  const content = $('#notification-content');
+  if (!content || !currentUser) return;
+  content.innerHTML = '<p class="muted">Loading…</p>';
+  const since = getPostSeenAt();
+  const [messages, requests, follows] = await Promise.all([
+    supabase.from('messages').select('id,sender_id,body,created_at').eq('recipient_id', currentUser.id).is('read_at', null).order('created_at', { ascending:false }).limit(8),
+    supabase.from('friendships').select('id,requester_id,created_at').eq('addressee_id', currentUser.id).eq('status','pending').order('created_at', { ascending:false }).limit(8),
+    supabase.from('follows').select('followed_id').eq('follower_id', currentUser.id)
+  ]);
+  if (messages.error || requests.error || follows.error) { content.innerHTML = `<p class="notification-empty">${esc(errorText(messages.error || requests.error || follows.error))}</p>`; return; }
+  const followedIds = [...new Set((follows.data || []).map(x => x.followed_id))];
+  let posts = { data:[], error:null };
+  if (followedIds.length) posts = await supabase.from('posts').select('id,user_id,body,created_at').in('user_id', followedIds).gt('created_at', since).order('created_at', { ascending:false }).limit(8);
+  if (posts.error) { content.innerHTML = `<p class="notification-empty">${esc(posts.error.message)}</p>`; return; }
+  const ids = [...new Set([...(messages.data || []).map(x => x.sender_id), ...(requests.data || []).map(x => x.requester_id), ...(posts.data || []).map(x => x.user_id)])];
+  let profiles = [];
+  if (ids.length) { const result = await supabase.from('profiles').select('id,display_name,username').in('id', ids); if (!result.error) profiles = result.data || []; }
+  const names = Object.fromEntries(profiles.map(x => [x.id, x.display_name || x.username || 'Member']));
+  const group = (title, rows, renderer) => rows.length ? `<div class="notification-group"><h4>${title}</h4>${rows.map(renderer).join('')}</div>` : '';
+  const messageHtml = group('Unread messages', messages.data || [], x => `<button class="notification-item" data-notification-chat="${x.sender_id}">New message from <strong>${esc(names[x.sender_id] || 'Member')}</strong><small>${esc(String(x.body || '').slice(0,90))} · ${new Date(x.created_at).toLocaleString()}</small></button>`);
+  const requestHtml = group('Friend requests', requests.data || [], x => `<button class="notification-item" data-notification-friends="${x.id}"><strong>${esc(names[x.requester_id] || 'Someone')}</strong> sent you a friend request<small>${new Date(x.created_at).toLocaleString()}</small></button>`);
+  const postHtml = group('New posts from people you follow', posts.data || [], x => `<button class="notification-item" data-notification-post="${x.user_id}" data-post-created="${esc(x.created_at)}"><strong>${esc(names[x.user_id] || 'Member')}</strong> published a post<small>${esc(String(x.body || '').slice(0,90))} · ${new Date(x.created_at).toLocaleString()}</small></button>`);
+  content.innerHTML = messageHtml + requestHtml + postHtml || '<p class="notification-empty">You are all caught up.</p>';
+  if (posts.data?.length) setPostSeenAt(posts.data[0].created_at);
+  await refreshNotificationBadges();
+}
+async function handleRealtimeNotification(payload) {
+  if (!currentUser || payload.eventType !== 'INSERT') return;
+  const row = payload.new || {};
+  if (payload.table === 'messages' && row.recipient_id === currentUser.id) {
+    const { data } = await supabase.from('profiles').select('display_name').eq('id', row.sender_id).maybeSingle();
+    toast(`New message from ${data?.display_name || 'someone'}`);
+  } else if (payload.table === 'friendships' && row.addressee_id === currentUser.id && row.status === 'pending') {
+    const { data } = await supabase.from('profiles').select('display_name').eq('id', row.requester_id).maybeSingle();
+    toast(`New friend request from ${data?.display_name || 'someone'}`);
+  } else if (payload.table === 'posts' && row.user_id !== currentUser.id) {
+    const { data: follow } = await supabase.from('follows').select('follower_id').eq('follower_id', currentUser.id).eq('followed_id', row.user_id).maybeSingle();
+    if (follow) {
+      const { data } = await supabase.from('profiles').select('display_name').eq('id', row.user_id).maybeSingle();
+      toast(`New post from ${data?.display_name || 'someone you follow'}`);
+    }
+  }
+  if (notificationRefreshTimer) window.clearTimeout(notificationRefreshTimer);
+  notificationRefreshTimer = window.setTimeout(() => { notificationRefreshTimer = null; refreshNotificationBadges(); }, 300);
 }
 function startRealtime(userId) {
   if (!supabase || !userId) return;
   stopRealtime();
+  initNotificationUI();
   const tables = ['profiles','posts','friendships','follows','messages','media_items','projects','movies','recommendations'];
   let channel = supabase.channel(`personal-space-live-${userId}`);
   for (const table of tables) {
     channel = channel.on('postgres_changes', { event: '*', schema: 'public', table }, payload => {
-      // Message read receipts are frequent updates; only new messages need a refresh.
       if (payload.table === 'messages' && payload.eventType !== 'INSERT') return;
+      handleRealtimeNotification(payload);
       scheduleRealtimeRefresh(payload);
     });
   }
@@ -104,6 +208,7 @@ function startRealtime(userId) {
     if (status === 'SUBSCRIBED') state.textContent = 'Live updates on';
     else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') state.textContent = 'Live updates reconnecting';
   });
+  refreshNotificationBadges();
 }
 async function loadProfile() {
   const { data, error } = await supabase.from('profiles').select('*').eq('id', currentUser.id).maybeSingle();
@@ -218,6 +323,7 @@ async function openChat(userId) {
   box.innerHTML = data.length ? data.map(m => `<p class="chat-line"><strong>${m.sender_id === currentUser.id ? 'You' : 'Friend'}:</strong> ${esc(m.body)}<span class="post-meta">${new Date(m.created_at).toLocaleString()}</span></p>`).join('') : empty('No messages yet. Start the conversation.');
   box.scrollTop = box.scrollHeight;
   await supabase.from('messages').update({ read_at: new Date().toISOString() }).eq('sender_id', userId).eq('recipient_id', currentUser.id).is('read_at', null);
+  refreshNotificationBadges();
 }
 async function renderMedia(kind) {
   const label = { image: 'Images', video: 'Videos', audio: 'Audio' }[kind];
@@ -367,6 +473,21 @@ async function submitMessage(form) {
 
 // Global click handling for the sidebar and dynamically rendered controls.
 document.addEventListener('click', async event => {
+  if (event.target.closest('#notification-button')) {
+    notificationPanelOpen = !notificationPanelOpen;
+    const panel = $('#notification-panel');
+    panel.hidden = !notificationPanelOpen;
+    $('#notification-button').setAttribute('aria-expanded', String(notificationPanelOpen));
+    if (notificationPanelOpen) await loadNotificationPanel();
+    return;
+  }
+  if (event.target.closest('#notification-close')) { notificationPanelOpen = false; $('#notification-panel').hidden = true; $('#notification-button').setAttribute('aria-expanded','false'); return; }
+  const notificationChat = event.target.closest('[data-notification-chat]');
+  if (notificationChat) { $('#notification-panel').hidden = true; notificationPanelOpen = false; go('messages'); await openChat(notificationChat.dataset.notificationChat); return; }
+  if (event.target.closest('[data-notification-friends]')) { $('#notification-panel').hidden = true; notificationPanelOpen = false; go('friends'); return; }
+  const notificationPost = event.target.closest('[data-notification-post]');
+  if (notificationPost) { setPostSeenAt(notificationPost.dataset.postCreated || new Date().toISOString()); $('#notification-panel').hidden = true; notificationPanelOpen = false; viewedProfileId = notificationPost.dataset.notificationPost; go('public-profile'); return; }
+  if (notificationPanelOpen && !event.target.closest('.notification-wrap')) { notificationPanelOpen = false; $('#notification-panel').hidden = true; $('#notification-button')?.setAttribute('aria-expanded','false'); }
   const nav = event.target.closest('[data-view]');
   if (nav) { event.preventDefault(); go(nav.dataset.view); return; }
   const tab = event.target.closest('[data-auth-tab]'); if (tab) { setAuthTab(tab.dataset.authTab); return; }
@@ -424,6 +545,6 @@ if (!isConfigured) {
   const { data, error } = await supabase.auth.getSession();
   if (error) setAuthMessage(error.message, true);
   currentUser = data.session?.user || null;
-  if (currentUser) { startRealtime(currentUser.id); showApp(); await renderView(); }
+  if (currentUser) { startRealtime(currentUser.id); showApp(); await renderView(); refreshNotificationBadges(); }
   else showAuth();
 }
