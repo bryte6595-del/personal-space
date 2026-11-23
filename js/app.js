@@ -18,6 +18,8 @@ let chatProfiles = {};
 let viewedProfileId = null;
 let renderToken = 0;
 let realtimeChannel = null;
+let presenceChannel = null;
+let onlineUserIds = new Set();
 let realtimeRefreshTimer = null;
 let notificationPanelOpen = false;
 let notificationRefreshTimer = null;
@@ -84,6 +86,18 @@ function stopRealtime() {
   realtimeRefreshTimer = null;
   if (realtimeChannel) supabase.removeChannel(realtimeChannel);
   realtimeChannel = null;
+  if (presenceChannel) supabase.removeChannel(presenceChannel);
+  presenceChannel = null;
+  onlineUserIds = new Set();
+}
+function updatePresenceDots() {
+  $$('[data-presence-user]').forEach(dot => {
+    const online = onlineUserIds.has(dot.dataset.presenceUser);
+    dot.classList.toggle('is-online', online);
+    dot.setAttribute('aria-label', online ? 'Online' : 'Offline');
+    dot.title = online ? 'Online' : 'Offline';
+    if (dot.classList.contains('presence-dot') && dot.parentElement?.classList.contains('chat-peer-presence')) dot.parentElement.lastChild.textContent = online ? 'Online' : 'Offline';
+  });
 }
 function scheduleRealtimeRefresh(payload) {
   if (!currentUser || !payload) return;
@@ -219,6 +233,20 @@ function startRealtime(userId) {
     });
   }
   realtimeChannel = channel.subscribe(() => {});
+  presenceChannel = supabase.channel('personal-space-presence', { config: { presence: { key: userId } } });
+  presenceChannel
+    .on('presence', { event: 'sync' }, () => {
+      const state = presenceChannel.presenceState();
+      const ids = new Set();
+      for (const [key, metas] of Object.entries(state)) {
+        if ((metas || []).some(meta => meta.user_id === key || meta.user_id)) ids.add(key);
+      }
+      onlineUserIds = ids;
+      updatePresenceDots();
+    })
+    .subscribe(async status => {
+      if (status === 'SUBSCRIBED') await presenceChannel.track({ user_id: userId, online_at: new Date().toISOString() });
+    });
   refreshNotificationBadges();
 }
 async function loadProfile() {
@@ -394,19 +422,34 @@ async function renderPosts() {
     section('Published posts', cards);
 }
 async function renderFriends() {
-  const { data: links, error } = await supabase.from('friendships').select('*').or(`requester_id.eq.${currentUser.id},addressee_id.eq.${currentUser.id}`).order('created_at', { ascending: false });
+  const [{ data: links, error }, { data: follows, error: followError }] = await Promise.all([
+    supabase.from('friendships').select('*').or(`requester_id.eq.${currentUser.id},addressee_id.eq.${currentUser.id}`).order('created_at', { ascending: false }),
+    supabase.from('follows').select('*').or(`follower_id.eq.${currentUser.id},followed_id.eq.${currentUser.id}`)
+  ]);
   if (error) throw error;
-  const { data: follows, error: followError } = await supabase.from('follows').select('*').or(`follower_id.eq.${currentUser.id},followed_id.eq.${currentUser.id}`);
   if (followError) throw followError;
+  const accepted = (links || []).filter(x => x.status === 'accepted');
+  const incoming = (links || []).filter(x => x.status === 'pending' && x.addressee_id === currentUser.id);
+  const sent = (links || []).filter(x => x.status === 'pending' && x.requester_id === currentUser.id);
+  const followers = (follows || []).filter(x => x.followed_id === currentUser.id);
+  const following = (follows || []).filter(x => x.follower_id === currentUser.id);
   const otherIds = [...new Set([...(links || []).map(x => x.requester_id === currentUser.id ? x.addressee_id : x.requester_id), ...(follows || []).map(x => x.follower_id === currentUser.id ? x.followed_id : x.follower_id)])];
   let people = [];
   if (otherIds.length) { const r = await supabase.from('profiles').select('id,username,display_name,avatar_url').in('id', otherIds); if (r.error) throw r.error; people = r.data || []; }
   const byId = Object.fromEntries(people.map(p => [p.id, p]));
-  const linkRows = links.length ? links.map(f => { const incoming = f.addressee_id === currentUser.id; const other = incoming ? f.requester_id : f.addressee_id; return `<li>${profileLink({id:other,...(byId[other]||{})})} <span class="muted">${incoming ? 'Incoming' : 'Outgoing'} ${esc(f.status)}</span> ${f.status === 'pending' && incoming ? `<button class="button" data-accept-friend="${f.id}">Accept</button>` : ''}</li>`; }).join('') : '';
-  viewContainer.innerHTML = pageHead('Friends & followers', 'Find people and manage connection requests.') +
-    `<form id="user-search" class="content-form"><h3>Find someone</h3><label>Exact username<input name="username" placeholder="username" required></label><button class="button" type="submit">Search</button><div id="search-results"></div></form>` +
-    section('Friend requests and connections', linkRows ? `<ul class="plain-list">${linkRows}</ul>` : empty('No friend requests or connections yet.')) +
-    section('Followers and following', follows?.length ? `<ul class="plain-list">${follows.map(f => { const outgoing = f.follower_id === currentUser.id; const other = outgoing ? f.followed_id : f.follower_id; const followsBack = follows.some(x => x.follower_id === currentUser.id && x.followed_id === other); const followBack = !outgoing && !followsBack ? `<button class="button subtle" data-follow-user="${other}">Follow back</button>` : followsBack && !outgoing ? '<span class="muted">You follow back</span>' : ''; return `<li><span class="muted">${outgoing ? 'You follow' : 'Follows you'}</span> ${profileLink({id:other,...(byId[other]||{})})} ${followBack}</li>`; }).join('')}</ul>` : empty('No followers or followed accounts yet.'));
+  const personRows = (rows, getId, action = '') => rows.length ? `<ul class="plain-list">${rows.map(row => { const id = getId(row); return `<li class="connection-row">${profileLink({ id, ...(byId[id] || {}) })}<span class="connection-actions">${action ? action(row, id) : ''}</span></li>`; }).join('')}</ul>` : empty('Nothing here yet.');
+  const incomingHtml = personRows(incoming, x => x.requester_id, x => `<button class="button primary" data-accept-friend="${x.id}">Accept</button><button class="button subtle" data-decline-friend="${x.id}">Decline</button>`);
+  const sentHtml = personRows(sent, x => x.addressee_id, x => `<span class="muted">Pending</span><button class="button subtle" data-cancel-friend="${x.id}">Cancel</button>`);
+  const friendsHtml = personRows(accepted, x => x.requester_id === currentUser.id ? x.addressee_id : x.requester_id, id => `<button class="button subtle" data-chat-user="${id}">Message</button>`);
+  const followersHtml = personRows(followers, x => x.follower_id, (x, id) => following.some(f => f.followed_id === id) ? '<span class="muted">Following</span>' : `<button class="button subtle" data-follow-user="${id}">Follow back</button>`);
+  const followingHtml = personRows(following, x => x.followed_id);
+  viewContainer.innerHTML = pageHead('Friends & followers', 'Keep your connections and requests in separate places.') +
+    `<form id="user-search" class="content-form connection-search"><h3>Find someone</h3><label>Search by exact username<input name="username" placeholder="Enter username" required></label><button class="button" type="submit">Search</button><div id="search-results"></div></form>` +
+    `<nav class="connection-tabs" aria-label="Connections sections">${[['friends','Friends',accepted.length],['followers','Followers',followers.length],['following','Following',following.length],['requests','Friend requests',incoming.length + sent.length]].map(([key,label,count]) => `<button type="button" class="connection-tab${key === 'friends' ? ' active' : ''}" data-friend-tab="${key}">${label}<span>${count}</span></button>`).join('')}</nav>` +
+    `<section class="connection-section" data-friend-section="friends"><h3 class="section-title">Friends</h3>${friendsHtml}</section>` +
+    `<section class="connection-section" data-friend-section="followers" hidden><h3 class="section-title">Followers</h3>${followersHtml}</section>` +
+    `<section class="connection-section" data-friend-section="following" hidden><h3 class="section-title">Following</h3>${followingHtml}</section>` +
+    `<section class="connection-section" data-friend-section="requests" hidden><h3 class="section-title">Incoming requests</h3>${incomingHtml}<h3 class="section-title request-subtitle">Sent requests</h3>${sentHtml}</section>`;
 }
 async function renderMessages() {
   const keepChat = activeChatUser;
@@ -420,20 +463,16 @@ async function renderMessages() {
   if (recentResult.error) throw recentResult.error;
   if (unreadResult.error) throw unreadResult.error;
   const latestByPerson = new Map();
-  for (const m of recentResult.data || []) {
-    const other = m.sender_id === currentUser.id ? m.recipient_id : m.sender_id;
-    if (!latestByPerson.has(other)) latestByPerson.set(other, m);
-  }
+  for (const m of recentResult.data || []) { const other = m.sender_id === currentUser.id ? m.recipient_id : m.sender_id; if (friendIds.includes(other) && !latestByPerson.has(other)) latestByPerson.set(other, m); }
   const unreadByPerson = {};
-  for (const m of unreadResult.data || []) unreadByPerson[m.sender_id] = (unreadByPerson[m.sender_id] || 0) + 1;
-  const ids = [...new Set([...friendIds, ...latestByPerson.keys()])];
+  for (const m of unreadResult.data || []) if (friendIds.includes(m.sender_id)) unreadByPerson[m.sender_id] = (unreadByPerson[m.sender_id] || 0) + 1;
   chatProfiles = {};
-  if (ids.length) {
-    const r = await supabase.from('profiles').select('id,username,display_name,avatar_url').in('id', ids);
+  if (friendIds.length) {
+    const r = await supabase.from('profiles').select('id,username,display_name,avatar_url').in('id', friendIds);
     if (r.error) throw r.error;
     chatProfiles = Object.fromEntries((r.data || []).map(p => [p.id, p]));
   }
-  const people = ids.map(id => chatProfiles[id] || { id, username: 'unknown', display_name: 'Member' });
+  const people = friendIds.map(id => chatProfiles[id] || { id, username: 'unknown', display_name: 'Member' });
   people.sort((a, b) => {
     const ta = latestByPerson.get(a.id)?.created_at || '';
     const tb = latestByPerson.get(b.id)?.created_at || '';
@@ -442,13 +481,12 @@ async function renderMessages() {
   const list = people.length ? people.map(p => {
     const last = latestByPerson.get(p.id);
     const unread = unreadByPerson[p.id] || 0;
-    const preview = last ? `${last.sender_id === currentUser.id ? 'You: ' : ''}${String(last.body || '').slice(0, 54)}` : 'No messages yet';
-    const when = last ? new Date(last.created_at).toLocaleString() : '';
-    return `<div class="conversation-item${keepChat === p.id ? ' active' : ''}"><button type="button" class="conversation-open" data-chat-user="${p.id}"><span class="conversation-topline"><strong>${esc(p.display_name)}</strong>${unread ? `<span class="conversation-unread">${unread > 99 ? '99+' : unread}</span>` : ''}</span><span class="muted conversation-handle">@${esc(p.username)}</span><span class="conversation-preview">${esc(preview)}</span>${when ? `<small class="conversation-time">${esc(when)}</small>` : ''}</button>${profileLink(p, 'View profile')}</div>`;
+    const preview = last ? `${last.sender_id === currentUser.id ? 'You: ' : ''}${String(last.body || '').slice(0, 54)}` : 'Start a conversation';
+    return `<button type="button" class="friend-chat-item${keepChat === p.id ? ' active' : ''}" data-chat-user="${p.id}"><span class="avatar mini">${p.avatar_url ? `<img src="${esc(safeHttpUrl(p.avatar_url))}" alt="">` : esc(initials(p.display_name))}</span><span class="friend-chat-info"><strong>${esc(p.display_name)}</strong><small>@${esc(p.username)}</small><span class="conversation-preview">${esc(preview)}</span></span><span class="friend-chat-status"><i class="presence-dot${onlineUserIds.has(p.id) ? ' is-online' : ''}" data-presence-user="${p.id}" aria-label="${onlineUserIds.has(p.id) ? 'Online' : 'Offline'}"></i>${unread ? `<b class="conversation-unread">${unread > 99 ? '99+' : unread}</b>` : ''}</span></button>`;
   }).join('') : empty('You need an accepted friend connection before messaging.');
-  viewContainer.innerHTML = pageHead('Messages', 'Recent conversations appear first. Unread messages are marked.') +
-    `<div class="message-layout"><div class="conversation-list"><strong>Recent conversations</strong>${list}</div><div class="chat-panel"><div class="chat-peer-header" id="chat-peer-header"></div><div class="chat-messages" id="chat-messages">${empty('Choose a conversation to open it.')}</div><form id="message-form" class="chat-compose"><input name="body" placeholder="Write a message…" aria-label="Message" maxlength="5000" required disabled><button class="button primary" type="submit" disabled>Send</button></form></div></div>`;
-  const selected = people.find(p => p.id === keepChat) || people.find(p => latestByPerson.has(p.id));
+  viewContainer.innerHTML = pageHead('Messages', 'Choose a friend to open your private conversation.') +
+    `<div class="message-layout friends-message-layout"><aside class="conversation-list"><strong>Your friends</strong><label class="message-search-label"><span class="sr-only">Search friends</span><input id="message-friend-search" type="search" placeholder="Search friends…" autocomplete="off"></label><div id="message-friend-list">${list}</div><p id="message-no-results" class="muted" hidden>No matching friends.</p></aside><section class="chat-panel"><div class="chat-peer-header" id="chat-peer-header">${empty('Select a friend to start chatting.')}</div><div class="chat-messages" id="chat-messages">${empty('Your conversation will appear here.')}</div><form id="message-form" class="chat-compose"><input name="body" placeholder="Write a message…" aria-label="Message" maxlength="5000" required disabled><button class="button primary" type="submit" disabled>Send</button></form></section></div>`;
+  const selected = people.find(p => p.id === keepChat);
   activeChatUser = null;
   if (selected) await openChat(selected.id);
 }
@@ -457,7 +495,7 @@ async function openChat(userId) {
   const box = $('#chat-messages');
   const form = $('#message-form');
   if (!box || !form) return;
-  $$('.conversation-item').forEach(button => button.classList.toggle('active', button.querySelector('[data-chat-user]')?.dataset.chatUser === userId));
+  $$('.friend-chat-item').forEach(button => button.classList.toggle('active', button.dataset.chatUser === userId));
   form.querySelector('input').disabled = false;
   form.querySelector('button').disabled = false;
   box.innerHTML = '<p class="muted">Loading conversation…</p>';
@@ -465,16 +503,18 @@ async function openChat(userId) {
     const profileResult = await supabase.from('profiles').select('id,username,display_name,avatar_url').eq('id', userId).maybeSingle();
     if (profileResult.data) chatProfiles[userId] = profileResult.data;
   }
-  const otherName = chatProfiles[userId]?.display_name || 'Member';
+  const peer = chatProfiles[userId] || { id: userId, display_name: 'Friend', username: 'unknown' };
+  const otherName = peer.display_name || 'Friend';
   const peerHeader = $('#chat-peer-header');
-  if (peerHeader) peerHeader.innerHTML = profileLink(chatProfiles[userId] || {id:userId,display_name:otherName,username:'unknown'}, 'View profile');
+  if (peerHeader) peerHeader.innerHTML = `${profileLink(peer, 'View profile')}<span class="chat-peer-presence"><i class="presence-dot${onlineUserIds.has(userId) ? ' is-online' : ''}" data-presence-user="${userId}"></i>${onlineUserIds.has(userId) ? 'Online' : 'Offline'}</span>`;
   const { data, error } = await supabase.from('messages').select('*').or(`and(sender_id.eq.${currentUser.id},recipient_id.eq.${userId}),and(sender_id.eq.${userId},recipient_id.eq.${currentUser.id})`).order('created_at', { ascending: true });
   if (error) { box.innerHTML = `<p class="error-text">${esc(error.message)}</p>`; return; }
-  box.innerHTML = data.length ? data.map(m => `<p class="chat-line"><strong>${m.sender_id === currentUser.id ? 'You' : esc(otherName)}:</strong> ${esc(m.body)}<span class="post-meta">${new Date(m.created_at).toLocaleString()}</span></p>`).join('') : empty('No messages yet. Start the conversation.');
+  box.innerHTML = data.length ? data.map(m => `<div class="chat-bubble-row ${m.sender_id === currentUser.id ? 'sent' : 'received'}"><div class="chat-bubble">${esc(m.body)}<span class="chat-bubble-time">${new Date(m.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span></div></div>`).join('') : empty('No messages yet. Start the conversation.');
   box.scrollTop = box.scrollHeight;
   await supabase.from('messages').update({ read_at: new Date().toISOString() }).eq('sender_id', userId).eq('recipient_id', currentUser.id).is('read_at', null);
-  $(`.conversation-item [data-chat-user=\"${userId}\"] .conversation-unread`)?.remove();
+  $(`.friend-chat-item[data-chat-user="${userId}"] .conversation-unread`)?.remove();
   refreshNotificationBadges();
+  updatePresenceDots();
 }
 async function renderMedia(kind) {
   const label = { image: 'Images', video: 'Videos', audio: 'Audio' }[kind];
@@ -799,11 +839,22 @@ document.addEventListener('click', async event => {
   const add = event.target.closest('[data-add-friend]'); if (add) { await sendFriendRequest(add.dataset.addFriend); return; }
   const accept = event.target.closest('[data-accept-friend]'); if (accept) { await acceptFriend(accept.dataset.acceptFriend); return; }
   const follow = event.target.closest('[data-follow-user]'); if (follow) { const { error } = await supabase.from('follows').insert({ follower_id: currentUser.id, followed_id: follow.dataset.followUser }); toast(error ? error.message : 'You are now following this person.'); if (!error) renderView(); return; }
+  const friendTab = event.target.closest('[data-friend-tab]'); if (friendTab) { $$('[data-friend-tab]').forEach(b => b.classList.toggle('active', b === friendTab)); $$('[data-friend-section]').forEach(panel => { panel.hidden = panel.dataset.friendSection !== friendTab.dataset.friendTab; }); return; }
+  const decline = event.target.closest('[data-decline-friend], [data-cancel-friend]'); if (decline) { const id = decline.dataset.declineFriend || decline.dataset.cancelFriend; if (!confirm(decline.hasAttribute('data-decline-friend') ? 'Decline this friend request?' : 'Cancel this sent request?')) return; const { error } = await supabase.from('friendships').delete().eq('id', id); toast(error ? error.message : 'Request removed.'); if (!error) renderView(); return; }
   const chat = event.target.closest('[data-chat-user]'); if (chat) { await openChat(chat.dataset.chatUser); return; }
   const delMedia = event.target.closest('[data-delete-media]'); if (delMedia) { if (!confirm('Delete this media item?')) return; const path = delMedia.dataset.storagePath; if (path) { const r = await supabase.storage.from('user-media').remove([path]); if (r.error) return toast(r.error.message); } const r = await supabase.from('media_items').delete().eq('id', delMedia.dataset.deleteMedia).eq('user_id', currentUser.id); toast(r.error ? r.error.message : 'Media deleted.'); if (!r.error) renderView(); return; }
   const delEntry = event.target.closest('[data-delete-entry]'); if (delEntry) { if (!confirm('Delete this entry?')) return; const { error } = await supabase.from(delEntry.dataset.table).delete().eq('id', delEntry.dataset.deleteEntry).eq('user_id', currentUser.id); toast(error ? error.message : 'Entry deleted.'); if (!error) renderCollection(delEntry.dataset.table); return; }
   if (event.target.closest('#reset-password')) { const { error } = await supabase.auth.resetPasswordForEmail(currentUser.email, { redirectTo: window.location.origin }); toast(error ? error.message : 'Password reset email requested.'); }
 });
+document.addEventListener('input', event => {
+  if (event.target.matches('#message-friend-search')) {
+    const query = event.target.value.trim().toLowerCase();
+    let shown = 0;
+    $$('.friend-chat-item').forEach(item => { const match = item.textContent.toLowerCase().includes(query); item.hidden = !match; if (match) shown++; });
+    const noResults = $('#message-no-results'); if (noResults) noResults.hidden = shown > 0;
+  }
+});
+
 document.addEventListener('change', event => {
   const input = event.target;
   if (input.matches('#post-form input[name="images"]')) { const preview = $('#post-image-preview'); const files = [...(input.files || [])]; if (files.length > 5) { toast('You can add up to 5 images.'); input.value = ''; preview.innerHTML = ''; return; } preview.innerHTML = files.map(file => `<span>${esc(file.name)}</span>`).join(''); }
