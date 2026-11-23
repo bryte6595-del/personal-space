@@ -6,7 +6,7 @@ const $$ = (s, root = document) => [...root.querySelectorAll(s)];
 const authScreen = $('#auth-screen');
 const app = $('#app');
 const viewContainer = $('#view-container');
-const titles = { home:'Home', profile:'My profile', 'public-profile':'Member profile', posts:'Posts', friends:'Friends & followers', messages:'Messages', images:'Images', videos:'Videos', audio:'Audio', projects:'Projects & games', movies:'Movies', recommendations:'Recommendations', settings:'Settings' };
+const titles = { home:'Home', profile:'My profile', 'public-profile':'Member profile', posts:'Posts', friends:'Friends & followers', messages:'Chats', images:'Images', videos:'Videos', audio:'Audio', projects:'Projects & games', movies:'Movies', recommendations:'Recommendations', settings:'Settings' };
 const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 function safeHttpUrl(value) { try { const url = new URL(String(value), location.origin); return ['http:', 'https:'].includes(url.protocol) ? url.href : ''; } catch { return ''; } }
 let supabase;
@@ -25,6 +25,8 @@ let notificationPanelOpen = false;
 let notificationRefreshTimer = null;
 let activeCropper = null;
 let messagePreviewUrl = null;
+let messageSendInProgress = false;
+let messagePressTimer = null;
 
 function toast(message) {
   const el = $('#toast');
@@ -510,16 +512,22 @@ async function renderMessages() {
   const { data: friends, error } = await supabase.from('friendships').select('requester_id,addressee_id,status').eq('status', 'accepted').or(`requester_id.eq.${currentUser.id},addressee_id.eq.${currentUser.id}`);
   if (error) throw error;
   const friendIds = [...new Set((friends || []).map(f => f.requester_id === currentUser.id ? f.addressee_id : f.requester_id))];
-  const [recentResult, unreadResult] = await Promise.all([
+  const [recentResult, unreadResult, hiddenResult, clearResult] = await Promise.all([
     supabase.from('messages').select('id,sender_id,recipient_id,body,media_path,created_at').or(`sender_id.eq.${currentUser.id},recipient_id.eq.${currentUser.id}`).order('created_at', { ascending: false }).limit(250),
-    supabase.from('messages').select('id,sender_id').eq('recipient_id', currentUser.id).is('read_at', null).order('created_at', { ascending: false })
+    supabase.from('messages').select('id,sender_id').eq('recipient_id', currentUser.id).is('read_at', null).order('created_at', { ascending: false }),
+    supabase.from('message_hidden').select('message_id').eq('user_id', currentUser.id),
+    supabase.from('conversation_clears').select('other_user_id,cleared_at').eq('user_id', currentUser.id)
   ]);
   if (recentResult.error) throw recentResult.error;
   if (unreadResult.error) throw unreadResult.error;
+  if (hiddenResult.error) throw hiddenResult.error;
+  if (clearResult.error) throw clearResult.error;
+  const hiddenIds = new Set((hiddenResult.data || []).map(x => x.message_id));
+  const clearMap = new Map((clearResult.data || []).map(x => [x.other_user_id, new Date(x.cleared_at).getTime()]));
   const latestByPerson = new Map();
-  for (const m of recentResult.data || []) { const other = m.sender_id === currentUser.id ? m.recipient_id : m.sender_id; if (friendIds.includes(other) && !latestByPerson.has(other)) latestByPerson.set(other, m); }
+  for (const m of recentResult.data || []) { const other = m.sender_id === currentUser.id ? m.recipient_id : m.sender_id; if (friendIds.includes(other) && !hiddenIds.has(m.id) && new Date(m.created_at).getTime() > (clearMap.get(other) || 0) && !latestByPerson.has(other)) latestByPerson.set(other, m); }
   const unreadByPerson = {};
-  for (const m of unreadResult.data || []) if (friendIds.includes(m.sender_id)) unreadByPerson[m.sender_id] = (unreadByPerson[m.sender_id] || 0) + 1;
+  for (const m of unreadResult.data || []) if (friendIds.includes(m.sender_id) && !hiddenIds.has(m.id) && new Date(m.created_at || 0).getTime() > (clearMap.get(m.sender_id) || 0)) unreadByPerson[m.sender_id] = (unreadByPerson[m.sender_id] || 0) + 1;
   chatProfiles = {};
   if (friendIds.length) {
     const r = await supabase.from('profiles').select('id,username,display_name,avatar_url').in('id', friendIds);
@@ -538,8 +546,8 @@ async function renderMessages() {
     const preview = last ? `${last.sender_id === currentUser.id ? 'You: ' : ''}${String(last.body || (last.media_path ? '📷 Image' : '')).slice(0, 54)}` : 'Start a conversation';
     return `<button type="button" class="friend-chat-item${keepChat === p.id ? ' active' : ''}" data-chat-user="${p.id}"><span class="avatar mini">${p.avatar_url ? `<img src="${esc(safeHttpUrl(p.avatar_url))}" alt="">` : esc(initials(p.display_name))}</span><span class="friend-chat-info"><strong>${esc(p.display_name)}</strong><small>@${esc(p.username)}</small><span class="conversation-preview">${esc(preview)}</span></span><span class="friend-chat-status"><i class="presence-dot${onlineUserIds.has(p.id) ? ' is-online' : ''}" data-presence-user="${p.id}" aria-label="${onlineUserIds.has(p.id) ? 'Online' : 'Offline'}"></i>${unread ? `<b class="conversation-unread">${unread > 99 ? '99+' : unread}</b>` : ''}</span></button>`;
   }).join('') : empty('You need an accepted friend connection before messaging.');
-  viewContainer.innerHTML = pageHead('Messages', 'Choose a friend to open your private conversation.') +
-    `<div class="message-layout friends-message-layout"><aside class="conversation-list"><strong>Your friends</strong><label class="message-search-label"><span class="sr-only">Search friends</span><input id="message-friend-search" type="search" placeholder="Search friends…" autocomplete="off"></label><div id="message-friend-list">${list}</div><p id="message-no-results" class="muted" hidden>No matching friends.</p></aside><section class="chat-panel"><div class="chat-peer-header" id="chat-peer-header">${empty('Select a friend to start chatting.')}</div><div class="chat-messages" id="chat-messages">${empty('Your conversation will appear here.')}</div><div id="message-image-preview" class="message-image-preview" hidden></div><form id="message-form" class="chat-compose"><label class="message-attach" title="Attach an image" aria-label="Attach an image">＋<input name="image" type="file" accept="image/jpeg,image/png,image/webp,image/gif" hidden disabled></label><div class="emoji-picker-wrap"><button type="button" class="emoji-toggle" data-toggle-emoji disabled aria-label="Choose emoji" title="Choose emoji">☺</button><div class="emoji-picker" id="message-emoji-picker" hidden>${["😀","😂","🥰","😍","😉","😊","😎","😭","😢","😡","👍","👎","👏","🙏","❤️","🔥","🎉","💯","🤔","🙌","😘","🤣","😅","💔","✨","🌹","☀️","💪"].map(emoji => `<button type="button" data-insert-emoji="${emoji}">${emoji}</button>`).join('')}</div></div><input name="body" placeholder="Write a message…" aria-label="Message" maxlength="5000" disabled><button class="button primary" type="submit" disabled>Send</button></form></section></div>`;
+  viewContainer.innerHTML = pageHead('Chats', 'Your conversations with friends.') +
+    `<div class="message-layout friends-message-layout${keepChat ? ' chat-open' : ''}"><aside class="conversation-list"><strong>Your friends</strong><label class="message-search-label"><span class="sr-only">Search friends</span><input id="message-friend-search" type="search" placeholder="Search friends…" autocomplete="off"></label><div id="message-friend-list">${list}</div><p id="message-no-results" class="muted" hidden>No matching friends.</p></aside><section class="chat-panel"><div class="chat-peer-header" id="chat-peer-header">${empty('Select a friend to start chatting.')}</div><div class="chat-messages" id="chat-messages">${empty('Your conversation will appear here.')}</div><div id="message-image-preview" class="message-image-preview" hidden></div><form id="message-form" class="chat-compose"><label class="message-attach" title="Attach an image" aria-label="Attach an image">＋<input name="image" type="file" accept="image/jpeg,image/png,image/webp,image/gif" hidden disabled></label><div class="emoji-picker-wrap"><button type="button" class="emoji-toggle" data-toggle-emoji disabled aria-label="Choose emoji" title="Choose emoji">☺</button><div class="emoji-picker" id="message-emoji-picker" hidden>${["😀","😂","🥰","😍","😉","😊","😎","😭","😢","😡","👍","👎","👏","🙏","❤️","🔥","🎉","💯","🤔","🙌","😘","🤣","😅","💔","✨","🌹","☀️","💪"].map(emoji => `<button type="button" data-insert-emoji="${emoji}">${emoji}</button>`).join('')}</div></div><input name="body" placeholder="Write a message…" aria-label="Message" maxlength="5000" disabled><button class="button primary" type="submit" disabled>Send</button></form></section></div>`;
   const selected = people.find(p => p.id === keepChat);
   activeChatUser = null;
   if (selected) await openChat(selected.id);
@@ -552,6 +560,7 @@ async function openChat(userId) {
     const oldPreview = $('#message-image-preview'); if (oldPreview) { oldPreview.hidden = true; oldPreview.innerHTML = ''; }
   }
   activeChatUser = userId;
+  $('.friends-message-layout')?.classList.add('chat-open');
   const box = $('#chat-messages');
   const form = $('#message-form');
   if (!box || !form) return;
@@ -568,18 +577,27 @@ async function openChat(userId) {
   const peer = chatProfiles[userId] || { id: userId, display_name: 'Friend', username: 'unknown' };
   const otherName = peer.display_name || 'Friend';
   const peerHeader = $('#chat-peer-header');
-  if (peerHeader) peerHeader.innerHTML = `${profileLink(peer, 'View profile')}<span class="chat-peer-presence"><i class="presence-dot${onlineUserIds.has(userId) ? ' is-online' : ''}" data-presence-user="${userId}"></i>${onlineUserIds.has(userId) ? 'Online' : 'Offline'}</span>`;
-  const { data, error } = await supabase.from('messages').select('*').or(`and(sender_id.eq.${currentUser.id},recipient_id.eq.${userId}),and(sender_id.eq.${userId},recipient_id.eq.${currentUser.id})`).order('created_at', { ascending: true });
-  if (error) { box.innerHTML = `<p class="error-text">${esc(error.message)}</p>`; return; }
+  if (peerHeader) peerHeader.innerHTML = `<button type="button" class="chat-back-button" data-back-chats aria-label="Back to chats">‹</button>${profileLink(peer, 'View profile')}<span class="chat-peer-presence"><i class="presence-dot${onlineUserIds.has(userId) ? ' is-online' : ''}" data-presence-user="${userId}"></i>${onlineUserIds.has(userId) ? 'Online' : 'Offline'}</span><button type="button" class="chat-options-button" data-chat-options aria-label="Chat options">⋯</button><div class="chat-options-menu" id="chat-options-menu" hidden><button type="button" data-delete-conversation>Delete conversation</button></div>`;
+  const [messageResult, hiddenResult, clearResult] = await Promise.all([
+    supabase.from('messages').select('*').or(`and(sender_id.eq.${currentUser.id},recipient_id.eq.${userId}),and(sender_id.eq.${userId},recipient_id.eq.${currentUser.id})`).order('created_at', { ascending: true }),
+    supabase.from('message_hidden').select('message_id').eq('user_id', currentUser.id),
+    supabase.from('conversation_clears').select('cleared_at').eq('user_id', currentUser.id).eq('other_user_id', userId).maybeSingle()
+  ]);
+  if (messageResult.error) { box.innerHTML = `<p class="error-text">${esc(messageResult.error.message)}</p>`; return; }
+  if (hiddenResult.error || clearResult.error) { box.innerHTML = `<p class="error-text">${esc((hiddenResult.error || clearResult.error).message)}</p>`; return; }
+  const hiddenIds = new Set((hiddenResult.data || []).map(x => x.message_id));
+  const clearedAt = clearResult.data?.cleared_at ? new Date(clearResult.data.cleared_at).getTime() : 0;
+  const data = (messageResult.data || []).filter(m => !hiddenIds.has(m.id) && new Date(m.created_at).getTime() > clearedAt);
   const renderedMessages = [];
-  for (const m of data || []) {
+  for (const m of data) {
     let imageMarkup = '';
     if (m.media_path) {
       const signed = await supabase.storage.from('message-media').createSignedUrl(m.media_path, 3600);
       if (!signed.error && signed.data?.signedUrl) imageMarkup = `<button type="button" class="chat-image-open" data-chat-image="${esc(signed.data.signedUrl)}" aria-label="View attached image"><img src="${esc(signed.data.signedUrl)}" alt="${esc(m.media_name || 'Image attachment')}" loading="lazy"></button>`;
       else imageMarkup = '<span class="muted chat-image-unavailable">Image unavailable</span>';
     }
-    renderedMessages.push(`<div class="chat-bubble-row ${m.sender_id === currentUser.id ? 'sent' : 'received'}"><div class="chat-bubble">${m.body ? `<div>${esc(m.body)}</div>` : ''}${imageMarkup}<span class="chat-bubble-time">${new Date(m.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span></div></div>`);
+    const mine = m.sender_id === currentUser.id;
+    renderedMessages.push(`<div class="chat-bubble-row ${mine ? 'sent' : 'received'}" data-message-row="${m.id}" data-message-sender="${m.sender_id}"><div class="chat-bubble"><div class="chat-message-actions"><button type="button" data-message-menu="${m.id}" aria-label="Message options">⋯</button><div class="message-context-menu" data-message-menu-panel="${m.id}" hidden><button type="button" data-copy-message="${m.id}">Copy</button><button type="button" data-delete-for-me="${m.id}">Delete for me</button>${mine ? `<button type="button" data-delete-for-everyone="${m.id}">Delete for everyone</button>` : ''}</div></div>${m.body ? `<div class="chat-message-body">${esc(m.body)}</div>` : ''}${imageMarkup}<span class="chat-bubble-time">${new Date(m.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span></div></div>`);
   }
   box.innerHTML = renderedMessages.length ? renderedMessages.join('') : empty('No messages yet. Start the conversation.');
   box.scrollTop = box.scrollHeight;
@@ -588,6 +606,42 @@ async function openChat(userId) {
   refreshNotificationBadges();
   updatePresenceDots();
 }
+async function deleteChatMessage(messageId, mode) {
+  const row = $(`[data-message-row="${messageId}"]`);
+  const senderId = row?.dataset.messageSender;
+  if (!row) return;
+  if (mode === 'copy') {
+    const body = row.querySelector('.chat-message-body')?.textContent || '';
+    if (!body) return toast('This message has no text to copy.');
+    try { await navigator.clipboard.writeText(body); toast('Message copied.'); } catch { toast('Copy is not available in this browser.'); }
+    return;
+  }
+  if (mode === 'me') {
+    const { error } = await supabase.from('message_hidden').insert({ user_id: currentUser.id, message_id: messageId });
+    if (error && !String(error.code).includes('23505')) return toast(error.message);
+    row.remove(); toast('Message deleted from your chat.'); return;
+  }
+  if (mode === 'everyone') {
+    if (senderId !== currentUser.id) return toast('You can only delete your own messages for everyone.');
+    if (!confirm('Delete this message for both people?')) return;
+    const { data: msg, error: readError } = await supabase.from('messages').select('media_path').eq('id', messageId).eq('sender_id', currentUser.id).maybeSingle();
+    if (readError) return toast(readError.message);
+    const { error } = await supabase.from('messages').delete().eq('id', messageId).eq('sender_id', currentUser.id);
+    if (error) return toast(error.message);
+    if (msg?.media_path) await supabase.storage.from('message-media').remove([msg.media_path]);
+    row.remove(); toast('Message deleted for everyone.');
+  }
+}
+async function clearChatForMe() {
+  if (!activeChatUser) return;
+  if (!confirm('Delete this conversation from your chat list? The other person will keep their messages. New messages can make it appear again.')) return;
+  const { error } = await supabase.from('conversation_clears').upsert({ user_id: currentUser.id, other_user_id: activeChatUser, cleared_at: new Date().toISOString() }, { onConflict: 'user_id,other_user_id' });
+  if (error) return toast(error.message);
+  activeChatUser = null;
+  await renderMessages();
+  toast('Conversation deleted from your chats.');
+}
+
 async function renderMedia(kind) {
   const label = { image: 'Images', video: 'Videos', audio: 'Audio' }[kind];
   const { data: items, error } = await supabase.from('media_items').select('*').eq('user_id', currentUser.id).eq('media_type', kind).order('created_at', { ascending: false });
@@ -834,33 +888,45 @@ async function submitMedia(form) {
 }
 async function submitMessage(form) {
   if (!activeChatUser) return toast('Choose a friend first.');
+  if (messageSendInProgress) return;
+  const sendButton = form.querySelector('button[type=submit]');
+  const originalLabel = sendButton?.textContent || 'Send';
+  messageSendInProgress = true;
+  if (sendButton) { sendButton.disabled = true; sendButton.textContent = 'Sending…'; }
+  const recipientId = activeChatUser;
   const fd = new FormData(form);
   const body = String(fd.get('body') || '').trim();
   const file = form.querySelector('input[name="image"]')?.files?.[0] || null;
-  if (!body && !file) return toast('Write a message or attach an image.');
-  if (body.length > 5000) return toast('Messages must be 5,000 characters or fewer.');
+  if (!body && !file) { messageSendInProgress = false; if (sendButton) { sendButton.disabled = false; sendButton.textContent = originalLabel; } return toast('Write a message or attach an image.'); }
+  if (body.length > 5000) { messageSendInProgress = false; if (sendButton) { sendButton.disabled = false; sendButton.textContent = originalLabel; } return toast('Messages must be 5,000 characters or fewer.'); }
   let mediaPath = null;
-  if (file) {
-    const allowed = ['image/jpeg','image/png','image/webp','image/gif'];
-    if (!allowed.includes(file.type)) return toast('Use JPG, PNG, WEBP or GIF images.');
-    if (file.size > 10 * 1024 * 1024) return toast('Images must be 10 MB or smaller.');
-    const safeName = file.name.replace(/[^a-zA-Z0-9._-]/g, '_').slice(-100) || 'image';
-    mediaPath = `${currentUser.id}/${crypto.randomUUID()}-${safeName}`;
-    const upload = await supabase.storage.from('message-media').upload(mediaPath, file, { upsert: false, contentType: file.type, cacheControl: '3600' });
-    if (upload.error) return toast(upload.error.message);
+  let messageInserted = false;
+  try {
+    if (file) {
+      const allowed = ['image/jpeg','image/png','image/webp','image/gif'];
+      if (!allowed.includes(file.type)) throw new Error('Use JPG, PNG, WEBP or GIF images.');
+      if (file.size > 10 * 1024 * 1024) throw new Error('Images must be 10 MB or smaller.');
+      const safeName = file.name.replace(/[^a-zA-Z0-9._-]/g, '_').slice(-100) || 'image';
+      mediaPath = `${currentUser.id}/${crypto.randomUUID()}-${safeName}`;
+      const upload = await supabase.storage.from('message-media').upload(mediaPath, file, { upsert: false, contentType: file.type, cacheControl: '3600' });
+      if (upload.error) throw upload.error;
+    }
+    const { error } = await supabase.from('messages').insert({ sender_id: currentUser.id, recipient_id: recipientId, body, media_path: mediaPath, media_type: file?.type || null, media_name: file?.name || null, media_size: file?.size || null });
+    if (error) throw error;
+    messageInserted = true;
+    if (messagePreviewUrl) URL.revokeObjectURL(messagePreviewUrl);
+    messagePreviewUrl = null;
+    form.reset();
+    const preview = $('#message-image-preview'); if (preview) { preview.hidden = true; preview.innerHTML = ''; }
+    await openChat(recipientId);
+  } catch (error) {
+    if (mediaPath && !messageInserted) await supabase.storage.from('message-media').remove([mediaPath]);
+    toast(errorText(error));
+  } finally {
+    messageSendInProgress = false;
+    if (sendButton?.isConnected) { sendButton.disabled = !activeChatUser; sendButton.textContent = originalLabel; }
   }
-  const { error } = await supabase.from('messages').insert({ sender_id: currentUser.id, recipient_id: activeChatUser, body, media_path: mediaPath, media_type: file?.type || null, media_name: file?.name || null, media_size: file?.size || null });
-  if (error) {
-    if (mediaPath) await supabase.storage.from('message-media').remove([mediaPath]);
-    return toast(error.message);
-  }
-  if (messagePreviewUrl) URL.revokeObjectURL(messagePreviewUrl);
-  messagePreviewUrl = null;
-  form.reset();
-  const preview = $('#message-image-preview'); if (preview) { preview.hidden = true; preview.innerHTML = ''; }
-  await openChat(activeChatUser);
 }
-
 function updateThemeButton() {
   const button = $('#theme-toggle');
   if (!button) return;
@@ -893,6 +959,24 @@ function toggleMobileSidebar() {
   else openMobileSidebar();
 }
 
+// Long-press on touch or right-click on desktop opens message actions.
+function showMessageActions(row) {
+  if (!row) return;
+  const id = row.dataset.messageRow;
+  const panel = $(`[data-message-menu-panel="${id}"]`);
+  if (panel) { $$('.message-context-menu').forEach(x => { if (x !== panel) x.hidden = true; }); panel.hidden = false; }
+}
+document.addEventListener('contextmenu', event => {
+  const row = event.target.closest('[data-message-row]');
+  if (row) { event.preventDefault(); showMessageActions(row); }
+});
+document.addEventListener('pointerdown', event => {
+  const row = event.target.closest('[data-message-row]');
+  if (!row || event.pointerType !== 'touch') return;
+  messagePressTimer = window.setTimeout(() => showMessageActions(row), 550);
+});
+['pointerup','pointercancel','pointermove'].forEach(type => document.addEventListener(type, () => { if (messagePressTimer) window.clearTimeout(messagePressTimer); messagePressTimer = null; }, { passive: true }));
+
 // Global click handling for the sidebar and dynamically rendered controls.
 document.addEventListener('click', async event => {
   if (event.target.closest('#notification-button')) {
@@ -920,6 +1004,14 @@ document.addEventListener('click', async event => {
   if (event.target.closest('#logout-button')) { stopRealtime(); await supabase.auth.signOut(); currentUser = null; currentProfile = null; showAuth(); return; }
   if (event.target.closest('[data-action="retry"]')) { renderView(); return; }
   if (event.target.closest('[data-load-new-posts]')) { await renderHome(); window.scrollTo({ top: 0, behavior: 'smooth' }); return; }
+  if (event.target.closest('[data-back-chats]')) { activeChatUser = null; await renderMessages(); return; }
+  if (event.target.closest('[data-chat-options]')) { const menu = $('#chat-options-menu'); if (menu) menu.hidden = !menu.hidden; return; }
+  if (event.target.closest('[data-delete-conversation]')) { await clearChatForMe(); return; }
+  const msgMenuButton = event.target.closest('[data-message-menu]');
+  if (msgMenuButton) { const panel = $(`[data-message-menu-panel="${msgMenuButton.dataset.messageMenu}"]`); if (panel) panel.hidden = !panel.hidden; return; }
+  const copyMsg = event.target.closest('[data-copy-message]'); if (copyMsg) { await deleteChatMessage(copyMsg.dataset.copyMessage, 'copy'); return; }
+  const deleteForMe = event.target.closest('[data-delete-for-me]'); if (deleteForMe) { await deleteChatMessage(deleteForMe.dataset.deleteForMe, 'me'); return; }
+  const deleteForEveryone = event.target.closest('[data-delete-for-everyone]'); if (deleteForEveryone) { await deleteChatMessage(deleteForEveryone.dataset.deleteForEveryone, 'everyone'); return; }
   if (event.target.closest('[data-toggle-emoji]')) { const picker = $('#message-emoji-picker'); if (picker) picker.hidden = !picker.hidden; return; }
   const insertEmoji = event.target.closest('[data-insert-emoji]'); if (insertEmoji) { const input = $('#message-form input[name=body]'); if (input && !input.disabled) { const start = input.selectionStart ?? input.value.length; const end = input.selectionEnd ?? input.value.length; input.value = input.value.slice(0,start) + insertEmoji.dataset.insertEmoji + input.value.slice(end); input.focus(); const pos = start + insertEmoji.dataset.insertEmoji.length; input.setSelectionRange(pos,pos); } const picker = $('#message-emoji-picker'); if (picker) picker.hidden = true; return; }
   if (event.target.closest('[data-action="focus-post"]') || event.target.closest('[data-action="new-post"]')) { if (currentView !== 'posts') go('posts'); else $('#post-form textarea')?.focus(); return; }
@@ -940,7 +1032,7 @@ document.addEventListener('click', async event => {
   const messageUser = event.target.closest('[data-message-user]'); if (messageUser) { const targetId = messageUser.dataset.messageUser; await go('messages'); await openChat(targetId); return; }
   const friendTab = event.target.closest('[data-friend-tab]'); if (friendTab) { $$('[data-friend-tab]').forEach(b => b.classList.toggle('active', b === friendTab)); $$('[data-friend-section]').forEach(panel => { panel.hidden = panel.dataset.friendSection !== friendTab.dataset.friendTab; }); return; }
   const decline = event.target.closest('[data-decline-friend], [data-cancel-friend]'); if (decline) { const id = decline.dataset.declineFriend || decline.dataset.cancelFriend; if (!confirm(decline.hasAttribute('data-decline-friend') ? 'Decline this friend request?' : 'Cancel this sent request?')) return; const { error } = await supabase.from('friendships').delete().eq('id', id); toast(error ? error.message : 'Request removed.'); if (!error) renderView(); return; }
-  const chat = event.target.closest('[data-chat-user]'); if (chat) { await openChat(chat.dataset.chatUser); return; }
+  const chat = event.target.closest('[data-chat-user]'); if (chat) { await openChat(chat.dataset.chatUser); $('.friends-message-layout')?.classList.add('chat-open'); return; }
   const delMedia = event.target.closest('[data-delete-media]'); if (delMedia) { if (!confirm('Delete this media item?')) return; const path = delMedia.dataset.storagePath; if (path) { const r = await supabase.storage.from('user-media').remove([path]); if (r.error) return toast(r.error.message); } const r = await supabase.from('media_items').delete().eq('id', delMedia.dataset.deleteMedia).eq('user_id', currentUser.id); toast(r.error ? r.error.message : 'Media deleted.'); if (!r.error) renderView(); return; }
   const delEntry = event.target.closest('[data-delete-entry]'); if (delEntry) { if (!confirm('Delete this entry?')) return; const { error } = await supabase.from(delEntry.dataset.table).delete().eq('id', delEntry.dataset.deleteEntry).eq('user_id', currentUser.id); toast(error ? error.message : 'Entry deleted.'); if (!error) renderCollection(delEntry.dataset.table); return; }
   if (event.target.closest('#reset-password')) { const { error } = await supabase.auth.resetPasswordForEmail(currentUser.email, { redirectTo: window.location.origin }); toast(error ? error.message : 'Password reset email requested.'); }
