@@ -24,6 +24,7 @@ let realtimeRefreshTimer = null;
 let notificationPanelOpen = false;
 let notificationRefreshTimer = null;
 let activeCropper = null;
+let messagePreviewUrl = null;
 
 function toast(message) {
   const el = $('#toast');
@@ -117,8 +118,12 @@ function scheduleRealtimeRefresh(payload) {
     }
     return;
   }
-  if (table === 'posts') relevant = (currentView === 'home') || (currentView === 'posts' && row.user_id === currentUser.id) || (currentView === 'public-profile' && row.user_id === viewedProfileId);
-  else if (['post_media','post_likes','post_comments'].includes(table)) relevant = ['home','posts','public-profile'].includes(currentView);
+  if (table === 'posts') {
+    if (currentView === 'home' && payload.eventType === 'INSERT' && row.user_id !== currentUser.id) { showNewPostsIndicator(); return; }
+    relevant = (currentView === 'home' && payload.eventType !== 'INSERT') || (currentView === 'posts' && row.user_id === currentUser.id) || (currentView === 'public-profile' && row.user_id === viewedProfileId);
+  }
+  else if (table === 'post_likes' || table === 'post_comment_likes') return;
+  else if (['post_media','post_comments'].includes(table)) relevant = ['home','posts','public-profile'].includes(currentView);
   else if (table === 'friendships' || table === 'follows') relevant = currentView === 'friends' || currentView === 'public-profile';
   else if (table === 'profiles') relevant = (currentView === 'profile' && row.id === currentUser.id) || (currentView === 'public-profile' && row.id === viewedProfileId);
   else if (table === 'media_items') relevant = (row.user_id === currentUser.id) && ['images','videos','audio'].includes(currentView);
@@ -126,6 +131,11 @@ function scheduleRealtimeRefresh(payload) {
   if (!relevant) return;
   if (realtimeRefreshTimer) window.clearTimeout(realtimeRefreshTimer);
   realtimeRefreshTimer = window.setTimeout(() => { realtimeRefreshTimer = null; if (currentUser) renderView(); }, 450);
+}
+function showNewPostsIndicator() {
+  if (currentView !== 'home' || !$('.section') || $('#new-posts-indicator')) return;
+  const feed = $('.post-feed') || $('.section');
+  feed.insertAdjacentHTML('beforebegin', '<div class="new-posts-banner-wrap"><button type="button" id="new-posts-indicator" class="button primary new-posts-indicator" data-load-new-posts>↑ New posts · View latest</button></div>');
 }
 function postSeenKey() { return `ps-posts-seen-${currentUser?.id || 'guest'}`; }
 function getPostSeenAt() {
@@ -179,7 +189,7 @@ async function loadNotificationPanel() {
   content.innerHTML = '<p class="muted">Loading…</p>';
   const since = getPostSeenAt();
   const [messages, requests, follows] = await Promise.all([
-    supabase.from('messages').select('id,sender_id,body,created_at').eq('recipient_id', currentUser.id).is('read_at', null).order('created_at', { ascending:false }).limit(8),
+    supabase.from('messages').select('id,sender_id,body,media_path,created_at').eq('recipient_id', currentUser.id).is('read_at', null).order('created_at', { ascending:false }).limit(8),
     supabase.from('friendships').select('id,requester_id,created_at').eq('addressee_id', currentUser.id).eq('status','pending').order('created_at', { ascending:false }).limit(8),
     supabase.from('follows').select('followed_id').eq('follower_id', currentUser.id)
   ]);
@@ -193,7 +203,7 @@ async function loadNotificationPanel() {
   if (ids.length) { const result = await supabase.from('profiles').select('id,display_name,username,avatar_url').in('id', ids); if (!result.error) profiles = result.data || []; }
   const names = Object.fromEntries(profiles.map(x => [x.id, x.display_name || x.username || 'Member']));
   const group = (title, rows, renderer) => rows.length ? `<div class="notification-group"><h4>${title}</h4>${rows.map(renderer).join('')}</div>` : '';
-  const messageHtml = group('Unread messages', messages.data || [], x => `<button class="notification-item" data-notification-chat="${x.sender_id}">New message from <strong>${esc(names[x.sender_id] || 'Member')}</strong><small>${esc(String(x.body || '').slice(0,90))} · ${new Date(x.created_at).toLocaleString()}</small></button>`);
+  const messageHtml = group('Unread messages', messages.data || [], x => `<button class="notification-item" data-notification-chat="${x.sender_id}">New message from <strong>${esc(names[x.sender_id] || 'Member')}</strong><small>${esc(String(x.body || (x.media_path ? '📷 Image attachment' : '')).slice(0,90))} · ${new Date(x.created_at).toLocaleString()}</small></button>`);
   const requestHtml = group('Friend requests', requests.data || [], x => `<button class="notification-item" data-notification-friends="${x.id}"><strong>${esc(names[x.requester_id] || 'Someone')}</strong> sent you a friend request<small>${new Date(x.created_at).toLocaleString()}</small></button>`);
   const postHtml = group('New posts from people you follow', posts.data || [], x => `<button class="notification-item" data-notification-post="${x.user_id}" data-post-created="${esc(x.created_at)}"><strong>${esc(names[x.user_id] || 'Member')}</strong> published a post<small>${esc(String(x.body || '').slice(0,90))} · ${new Date(x.created_at).toLocaleString()}</small></button>`);
   content.innerHTML = messageHtml + requestHtml + postHtml || '<p class="notification-empty">You are all caught up.</p>';
@@ -223,7 +233,7 @@ function startRealtime(userId) {
   if (!supabase || !userId) return;
   stopRealtime();
   initNotificationUI();
-  const tables = ['profiles','posts','post_media','post_likes','post_comments','friendships','follows','messages','media_items','projects','movies','recommendations'];
+  const tables = ['profiles','posts','post_media','post_likes','post_comments','post_comment_likes','friendships','follows','messages','media_items','projects','movies','recommendations'];
   let channel = supabase.channel(`personal-space-live-${userId}`);
   for (const table of tables) {
     channel = channel.on('postgres_changes', { event: '*', schema: 'public', table }, payload => {
@@ -280,6 +290,10 @@ async function buildPostCards(posts, { allowDelete = false } = {}) {
     supabase.from('profiles').select('id,username,display_name,avatar_url').in('id', userIds)
   ]);
   for (const result of [mediaResult, likesResult, commentsResult, profilesResult]) if (result.error) throw result.error;
+  const commentIds = (commentsResult.data || []).map(comment => comment.id);
+  let commentLikesResult = { data: [], error: null };
+  if (commentIds.length) commentLikesResult = await supabase.from('post_comment_likes').select('comment_id,user_id').in('comment_id', commentIds);
+  if (commentLikesResult.error) throw commentLikesResult.error;
   const mediaByPost = {};
   await Promise.all((mediaResult.data || []).map(async item => {
     const signed = await supabase.storage.from('user-media').createSignedUrl(item.storage_path, 3600);
@@ -300,10 +314,13 @@ async function buildPostCards(posts, { allowDelete = false } = {}) {
   for (const like of likesResult.data || []) (likersByPost[like.post_id] ||= []).push(profileById[like.user_id] || { id: like.user_id, display_name: 'Member', username: 'unknown' });
   const commentsByPost = {};
   for (const comment of commentsResult.data || []) (commentsByPost[comment.post_id] ||= []).push(comment);
+  const commentLikesById = {};
+  for (const like of commentLikesResult.data || []) { const item = (commentLikesById[like.comment_id] ||= { count: 0, mine: false }); item.count++; if (like.user_id === currentUser.id) item.mine = true; }
   const commentMarkup = (comment, all, depth = 0) => {
     const person = profileById[comment.user_id] || { id: comment.user_id, display_name: 'Member', username: 'unknown' };
     const replies = all.filter(x => x.parent_comment_id === comment.id);
-    return `<div class="post-comment${depth ? ' post-reply' : ''}"><div class="comment-head">${profileLink(person)}<span class="post-meta">${new Date(comment.created_at).toLocaleString()}</span></div><p class="comment-body">${esc(comment.body)}</p><div class="comment-actions">${depth === 0 ? `<button class="text-button" type="button" data-reply-comment="${comment.id}" data-post-id="${comment.post_id}">Reply</button>` : ''}${comment.user_id === currentUser.id ? `<button class="text-button" type="button" data-edit-comment="${comment.id}">Edit</button><button class="text-button" type="button" data-delete-comment="${comment.id}" data-post-id="${comment.post_id}">Delete</button>` : ''}</div>${comment.user_id === currentUser.id ? `<form class="edit-comment-form" data-edit-comment-form="${comment.id}" hidden><input name="body" maxlength="2000" value="${esc(comment.body)}" required><button class="button" type="submit">Save</button></form>` : ''}<form class="reply-form" data-reply-form="${comment.id}" data-post-id="${comment.post_id}" hidden><input name="body" maxlength="2000" placeholder="Write a reply…" required><button class="button" type="submit">Reply</button></form>${depth === 0 && replies.length ? `<div class="comment-replies">${replies.map(reply => commentMarkup(reply, all, 1)).join('')}</div>` : ''}</div>`;
+    const commentLike = commentLikesById[comment.id] || { count: 0, mine: false };
+    return `<div class="post-comment${depth ? ' post-reply' : ''}"><div class="comment-head">${profileLink(person)}<span class="post-meta">${new Date(comment.created_at).toLocaleString()}</span></div><p class="comment-body">${esc(comment.body)}</p><div class="comment-actions"><button class="text-button comment-like-button${commentLike.mine ? ' liked' : ''}" type="button" data-toggle-comment-like="${comment.id}" aria-pressed="${commentLike.mine}">${commentLike.mine ? '♥ Liked' : '♡ Like'} <span data-comment-like-count="${comment.id}">${commentLike.count || ''}</span></button>${depth === 0 ? `<button class="text-button" type="button" data-reply-comment="${comment.id}" data-post-id="${comment.post_id}">Reply</button>` : ''}${comment.user_id === currentUser.id ? `<button class="text-button" type="button" data-edit-comment="${comment.id}">Edit</button><button class="text-button" type="button" data-delete-comment="${comment.id}" data-post-id="${comment.post_id}">Delete</button>` : ''}</div>${comment.user_id === currentUser.id ? `<form class="edit-comment-form" data-edit-comment-form="${comment.id}" hidden><input name="body" maxlength="2000" value="${esc(comment.body)}" required><button class="button" type="submit">Save</button></form>` : ''}<form class="reply-form" data-reply-form="${comment.id}" data-post-id="${comment.post_id}" hidden><input name="body" maxlength="2000" placeholder="Write a reply…" required><button class="button" type="submit">Reply</button></form>${depth === 0 && replies.length ? `<div class="comment-replies">${replies.map(reply => commentMarkup(reply, all, 1)).join('')}</div>` : ''}</div>`;
   };
   return `<div class="post-feed">${posts.map(post => {
     const author = profileById[post.user_id] || { id: post.user_id, display_name: 'Member', username: 'unknown' };
@@ -312,14 +329,17 @@ async function buildPostCards(posts, { allowDelete = false } = {}) {
     const like = likesByPost[post.id] || { count: 0, mine: false };
     const comments = commentsByPost[post.id] || [];
     const roots = comments.filter(c => !c.parent_comment_id);
-    return `<article class="post-card" data-post-card="${post.id}"><div class="post-card-head">${profileLink(author)}<div class="post-head-meta"><span class="post-meta">${new Date(post.created_at).toLocaleString()}</span><span class="post-visibility">${esc(post.visibility)}</span></div>${allowDelete && post.user_id === currentUser.id ? `<button type="button" class="text-button" data-delete-post="${post.id}">Delete</button>` : ''}</div>${post.body ? `<p class="post-body">${esc(post.body)}</p>` : ''}${gallery}<div class="post-engagement"><button type="button" class="text-button like-button${like.mine ? ' liked' : ''}" data-toggle-like="${post.id}" aria-pressed="${like.mine}">${like.mine ? '♥ Liked' : '♡ Like'}</button><button type="button" class="text-button likes-count" data-show-likes="${post.id}" ${like.count ? '' : 'disabled'}>${like.count} ${like.count === 1 ? 'like' : 'likes'}</button><span class="post-meta">${comments.length} ${comments.length === 1 ? 'comment' : 'comments'}</span></div><div class="post-likers" data-likers="${post.id}" hidden>${(likersByPost[post.id] || []).map(person => profileLink(person)).join('')}</div><div class="post-comments">${roots.map(c => commentMarkup(c, comments)).join('')}<form class="comment-form" data-comment-form="${post.id}"><input name="body" maxlength="2000" placeholder="Write a comment…" required><button class="button" type="submit">Comment</button></form></div></article>`;
+    return `<article class="post-card" data-post-card="${post.id}"><div class="post-card-head">${profileLink(author)}<div class="post-head-meta"><span class="post-meta">${new Date(post.created_at).toLocaleString()}</span><span class="post-visibility">${esc(post.visibility)}</span></div>${allowDelete && post.user_id === currentUser.id ? `<button type="button" class="text-button" data-delete-post="${post.id}">Delete</button>` : ''}</div>${post.body ? `<p class="post-body">${esc(post.body)}</p>` : ''}${gallery}<div class="post-engagement"><button type="button" class="text-button like-button${like.mine ? ' liked' : ''}" data-toggle-like="${post.id}" aria-pressed="${like.mine}">${like.mine ? '♥ Liked' : '♡ Like'}</button><button type="button" class="text-button likes-count" data-show-likes="${post.id}" data-like-count="${like.count}" ${like.count ? '' : 'disabled'}>${like.count} ${like.count === 1 ? 'like' : 'likes'}</button><span class="post-meta">${comments.length} ${comments.length === 1 ? 'comment' : 'comments'}</span></div><div class="post-likers" data-likers="${post.id}" hidden>${(likersByPost[post.id] || []).map(person => profileLink(person)).join('')}</div><div class="post-comments">${roots.map(c => commentMarkup(c, comments)).join('')}<form class="comment-form" data-comment-form="${post.id}"><input name="body" maxlength="2000" placeholder="Write a comment…" required><button class="button" type="submit">Comment</button></form></div></article>`;
   }).join('')}</div>`;
 }
 function openPostImage(button) {
   const gallery = button.closest('.post-gallery');
   const images = [...(gallery?.querySelectorAll('[data-post-image]') || [])].map(el => el.dataset.postImage);
-  if (!images.length) return;
-  let index = Number(button.dataset.imageIndex) || 0;
+  if (images.length) openImageViewer(images, Number(button.dataset.imageIndex) || 0);
+}
+function openImageViewer(images, initialIndex = 0) {
+  if (!images?.length) return;
+  let index = Math.max(0, Math.min(initialIndex, images.length - 1));
   const modal = document.createElement('div');
   modal.className = 'image-viewer-backdrop';
   modal.innerHTML = `<div class="image-viewer" role="dialog" aria-modal="true" aria-label="Image viewer"><button type="button" class="image-viewer-close" aria-label="Close image">×</button><button type="button" class="image-viewer-prev" aria-label="Previous image" ${images.length < 2 ? 'hidden' : ''}>‹</button><img class="image-viewer-image" alt="Enlarged post image"><button type="button" class="image-viewer-next" aria-label="Next image" ${images.length < 2 ? 'hidden' : ''}>›</button><span class="image-viewer-count"></span></div>`;
@@ -337,14 +357,48 @@ function openPostImage(button) {
   document.body.append(modal); show();
 }
 async function togglePostLike(postId) {
+  const button = $(`[data-toggle-like="${postId}"]`);
+  if (!button || button.disabled) return;
+  button.disabled = true;
   const existing = await supabase.from('post_likes').select('post_id').eq('post_id', postId).eq('user_id', currentUser.id).maybeSingle();
-  if (existing.error) return toast(existing.error.message);
+  if (existing.error) { button.disabled = false; return toast(existing.error.message); }
   const result = existing.data
     ? await supabase.from('post_likes').delete().eq('post_id', postId).eq('user_id', currentUser.id)
     : await supabase.from('post_likes').insert({ post_id: postId, user_id: currentUser.id });
-  if (result.error) return toast(result.error.message);
-  renderView();
+  if (result.error) { button.disabled = false; return toast(result.error.message); }
+  const liked = !existing.data;
+  button.classList.toggle('liked', liked);
+  button.setAttribute('aria-pressed', String(liked));
+  button.textContent = liked ? '♥ Liked' : '♡ Like';
+  button.disabled = false;
+  const countButton = $(`[data-show-likes="${postId}"]`);
+  if (countButton) {
+    const count = Math.max(0, Number(countButton.dataset.likeCount || 0) + (liked ? 1 : -1));
+    countButton.dataset.likeCount = String(count);
+    countButton.textContent = `${count} ${count === 1 ? 'like' : 'likes'}`;
+    countButton.disabled = count === 0;
+  }
 }
+async function toggleCommentLike(commentId) {
+  const button = $(`[data-toggle-comment-like="${commentId}"]`);
+  if (!button || button.disabled) return;
+  button.disabled = true;
+  const existing = await supabase.from('post_comment_likes').select('comment_id').eq('comment_id', commentId).eq('user_id', currentUser.id).maybeSingle();
+  if (existing.error) { button.disabled = false; return toast(existing.error.message); }
+  const result = existing.data
+    ? await supabase.from('post_comment_likes').delete().eq('comment_id', commentId).eq('user_id', currentUser.id)
+    : await supabase.from('post_comment_likes').insert({ comment_id: commentId, user_id: currentUser.id });
+  if (result.error) { button.disabled = false; return toast(result.error.message); }
+  const liked = !existing.data;
+  button.classList.toggle('liked', liked);
+  button.setAttribute('aria-pressed', String(liked));
+  const count = $(`[data-comment-like-count="${commentId}"]`);
+  const next = Math.max(0, Number(count?.textContent || 0) + (liked ? 1 : -1));
+  if (count) count.textContent = next ? String(next) : '';
+  button.firstChild.textContent = liked ? '♥ Liked ' : '♡ Like ';
+  button.disabled = false;
+}
+
 async function submitPostComment(form) {
   const postId = form.dataset.commentForm || form.dataset.postId;
   const parentId = form.dataset.parentComment || form.dataset.replyForm || null;
@@ -402,8 +456,8 @@ async function renderPublicProfile() {
   const coverUrl = safeHttpUrl(person.cover_url);
   const avatar = avatarUrl ? `<img src="${esc(avatarUrl)}" alt="${esc(person.display_name)}" style="width:100%;height:100%;object-fit:cover">` : esc(initials(person.display_name));
   const cover = coverUrl ? `<img src="${esc(coverUrl)}" alt="${esc(person.display_name)} cover" style="width:100%;max-height:190px;object-fit:cover;border:1px solid var(--line);margin-bottom:16px">` : '';
-  const friendshipAction = friendship ? `<span class="muted">Friendship: ${esc(friendship.status)}</span>` : `<button class="button" data-add-friend="${person.id}">Send friend request</button>`;
-  const followAction = following ? '<span class="muted">You follow this person</span>' : `<button class="button" data-follow-user="${person.id}">Follow</button>`;
+  const friendshipAction = friendship?.status === 'accepted' ? '<span class="relationship-label">Friends</span><button class="button" data-message-user="' + person.id + '">Message</button>' : friendship?.status === 'pending' ? `<span class="muted">${friendship.requester_id === currentUser.id ? 'Friend request sent' : 'They sent you a friend request'}</span>` : friendship ? `<span class="muted">${esc(friendship.status)}</span>` : `<button class="button" data-add-friend="${person.id}">Add friend</button>`;
+  const followAction = following ? `<button class="button" data-toggle-follow="${person.id}">Unfollow</button>` : `<button class="button" data-toggle-follow="${person.id}">Follow</button>`;
   const websiteUrl = safeHttpUrl(person.website);
   const website = websiteUrl ? `<p><a href="${esc(websiteUrl)}" target="_blank" rel="noopener noreferrer">${esc(person.website)}</a></p>` : '';
   const postRows = await buildPostCards(posts || []);
@@ -441,7 +495,7 @@ async function renderFriends() {
   const incomingHtml = personRows(incoming, x => x.requester_id, x => `<button class="button primary" data-accept-friend="${x.id}">Accept</button><button class="button subtle" data-decline-friend="${x.id}">Decline</button>`);
   const sentHtml = personRows(sent, x => x.addressee_id, x => `<span class="muted">Pending</span><button class="button subtle" data-cancel-friend="${x.id}">Cancel</button>`);
   const friendsHtml = personRows(accepted, x => x.requester_id === currentUser.id ? x.addressee_id : x.requester_id, id => `<button class="button subtle" data-chat-user="${id}">Message</button>`);
-  const followersHtml = personRows(followers, x => x.follower_id, (x, id) => following.some(f => f.followed_id === id) ? '<span class="muted">Following</span>' : `<button class="button subtle" data-follow-user="${id}">Follow back</button>`);
+  const followersHtml = personRows(followers, x => x.follower_id, (x, id) => `<button class="button subtle" data-toggle-follow="${id}">${following.some(f => f.followed_id === id) ? 'Unfollow' : 'Follow back'}</button>`);
   const followingHtml = personRows(following, x => x.followed_id);
   viewContainer.innerHTML = pageHead('Friends & followers', 'Keep your connections and requests in separate places.') +
     `<form id="user-search" class="content-form connection-search"><h3>Find someone</h3><label>Search by exact username<input name="username" placeholder="Enter username" required></label><button class="button" type="submit">Search</button><div id="search-results"></div></form>` +
@@ -457,7 +511,7 @@ async function renderMessages() {
   if (error) throw error;
   const friendIds = [...new Set((friends || []).map(f => f.requester_id === currentUser.id ? f.addressee_id : f.requester_id))];
   const [recentResult, unreadResult] = await Promise.all([
-    supabase.from('messages').select('id,sender_id,recipient_id,body,created_at').or(`sender_id.eq.${currentUser.id},recipient_id.eq.${currentUser.id}`).order('created_at', { ascending: false }).limit(250),
+    supabase.from('messages').select('id,sender_id,recipient_id,body,media_path,created_at').or(`sender_id.eq.${currentUser.id},recipient_id.eq.${currentUser.id}`).order('created_at', { ascending: false }).limit(250),
     supabase.from('messages').select('id,sender_id').eq('recipient_id', currentUser.id).is('read_at', null).order('created_at', { ascending: false })
   ]);
   if (recentResult.error) throw recentResult.error;
@@ -481,23 +535,31 @@ async function renderMessages() {
   const list = people.length ? people.map(p => {
     const last = latestByPerson.get(p.id);
     const unread = unreadByPerson[p.id] || 0;
-    const preview = last ? `${last.sender_id === currentUser.id ? 'You: ' : ''}${String(last.body || '').slice(0, 54)}` : 'Start a conversation';
+    const preview = last ? `${last.sender_id === currentUser.id ? 'You: ' : ''}${String(last.body || (last.media_path ? '📷 Image' : '')).slice(0, 54)}` : 'Start a conversation';
     return `<button type="button" class="friend-chat-item${keepChat === p.id ? ' active' : ''}" data-chat-user="${p.id}"><span class="avatar mini">${p.avatar_url ? `<img src="${esc(safeHttpUrl(p.avatar_url))}" alt="">` : esc(initials(p.display_name))}</span><span class="friend-chat-info"><strong>${esc(p.display_name)}</strong><small>@${esc(p.username)}</small><span class="conversation-preview">${esc(preview)}</span></span><span class="friend-chat-status"><i class="presence-dot${onlineUserIds.has(p.id) ? ' is-online' : ''}" data-presence-user="${p.id}" aria-label="${onlineUserIds.has(p.id) ? 'Online' : 'Offline'}"></i>${unread ? `<b class="conversation-unread">${unread > 99 ? '99+' : unread}</b>` : ''}</span></button>`;
   }).join('') : empty('You need an accepted friend connection before messaging.');
   viewContainer.innerHTML = pageHead('Messages', 'Choose a friend to open your private conversation.') +
-    `<div class="message-layout friends-message-layout"><aside class="conversation-list"><strong>Your friends</strong><label class="message-search-label"><span class="sr-only">Search friends</span><input id="message-friend-search" type="search" placeholder="Search friends…" autocomplete="off"></label><div id="message-friend-list">${list}</div><p id="message-no-results" class="muted" hidden>No matching friends.</p></aside><section class="chat-panel"><div class="chat-peer-header" id="chat-peer-header">${empty('Select a friend to start chatting.')}</div><div class="chat-messages" id="chat-messages">${empty('Your conversation will appear here.')}</div><form id="message-form" class="chat-compose"><input name="body" placeholder="Write a message…" aria-label="Message" maxlength="5000" required disabled><button class="button primary" type="submit" disabled>Send</button></form></section></div>`;
+    `<div class="message-layout friends-message-layout"><aside class="conversation-list"><strong>Your friends</strong><label class="message-search-label"><span class="sr-only">Search friends</span><input id="message-friend-search" type="search" placeholder="Search friends…" autocomplete="off"></label><div id="message-friend-list">${list}</div><p id="message-no-results" class="muted" hidden>No matching friends.</p></aside><section class="chat-panel"><div class="chat-peer-header" id="chat-peer-header">${empty('Select a friend to start chatting.')}</div><div class="chat-messages" id="chat-messages">${empty('Your conversation will appear here.')}</div><div id="message-image-preview" class="message-image-preview" hidden></div><form id="message-form" class="chat-compose"><label class="message-attach" title="Attach an image" aria-label="Attach an image">＋<input name="image" type="file" accept="image/jpeg,image/png,image/webp,image/gif" hidden disabled></label><div class="emoji-picker-wrap"><button type="button" class="emoji-toggle" data-toggle-emoji disabled aria-label="Choose emoji" title="Choose emoji">☺</button><div class="emoji-picker" id="message-emoji-picker" hidden>${["😀","😂","🥰","😍","😉","😊","😎","😭","😢","😡","👍","👎","👏","🙏","❤️","🔥","🎉","💯","🤔","🙌","😘","🤣","😅","💔","✨","🌹","☀️","💪"].map(emoji => `<button type="button" data-insert-emoji="${emoji}">${emoji}</button>`).join('')}</div></div><input name="body" placeholder="Write a message…" aria-label="Message" maxlength="5000" disabled><button class="button primary" type="submit" disabled>Send</button></form></section></div>`;
   const selected = people.find(p => p.id === keepChat);
   activeChatUser = null;
   if (selected) await openChat(selected.id);
 }
 async function openChat(userId) {
+  if (activeChatUser && activeChatUser !== userId) {
+    const oldInput = $('#message-form input[name="image"]'); if (oldInput) oldInput.value = '';
+    if (messagePreviewUrl) URL.revokeObjectURL(messagePreviewUrl);
+    messagePreviewUrl = null;
+    const oldPreview = $('#message-image-preview'); if (oldPreview) { oldPreview.hidden = true; oldPreview.innerHTML = ''; }
+  }
   activeChatUser = userId;
   const box = $('#chat-messages');
   const form = $('#message-form');
   if (!box || !form) return;
   $$('.friend-chat-item').forEach(button => button.classList.toggle('active', button.dataset.chatUser === userId));
-  form.querySelector('input').disabled = false;
-  form.querySelector('button').disabled = false;
+  form.querySelector('input[name=body]').disabled = false;
+  form.querySelector('input[name=image]').disabled = false;
+  form.querySelector('[data-toggle-emoji]').disabled = false;
+  form.querySelector('button[type=submit]').disabled = false;
   box.innerHTML = '<p class="muted">Loading conversation…</p>';
   if (!chatProfiles[userId]) {
     const profileResult = await supabase.from('profiles').select('id,username,display_name,avatar_url').eq('id', userId).maybeSingle();
@@ -509,7 +571,17 @@ async function openChat(userId) {
   if (peerHeader) peerHeader.innerHTML = `${profileLink(peer, 'View profile')}<span class="chat-peer-presence"><i class="presence-dot${onlineUserIds.has(userId) ? ' is-online' : ''}" data-presence-user="${userId}"></i>${onlineUserIds.has(userId) ? 'Online' : 'Offline'}</span>`;
   const { data, error } = await supabase.from('messages').select('*').or(`and(sender_id.eq.${currentUser.id},recipient_id.eq.${userId}),and(sender_id.eq.${userId},recipient_id.eq.${currentUser.id})`).order('created_at', { ascending: true });
   if (error) { box.innerHTML = `<p class="error-text">${esc(error.message)}</p>`; return; }
-  box.innerHTML = data.length ? data.map(m => `<div class="chat-bubble-row ${m.sender_id === currentUser.id ? 'sent' : 'received'}"><div class="chat-bubble">${esc(m.body)}<span class="chat-bubble-time">${new Date(m.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span></div></div>`).join('') : empty('No messages yet. Start the conversation.');
+  const renderedMessages = [];
+  for (const m of data || []) {
+    let imageMarkup = '';
+    if (m.media_path) {
+      const signed = await supabase.storage.from('message-media').createSignedUrl(m.media_path, 3600);
+      if (!signed.error && signed.data?.signedUrl) imageMarkup = `<button type="button" class="chat-image-open" data-chat-image="${esc(signed.data.signedUrl)}" aria-label="View attached image"><img src="${esc(signed.data.signedUrl)}" alt="${esc(m.media_name || 'Image attachment')}" loading="lazy"></button>`;
+      else imageMarkup = '<span class="muted chat-image-unavailable">Image unavailable</span>';
+    }
+    renderedMessages.push(`<div class="chat-bubble-row ${m.sender_id === currentUser.id ? 'sent' : 'received'}"><div class="chat-bubble">${m.body ? `<div>${esc(m.body)}</div>` : ''}${imageMarkup}<span class="chat-bubble-time">${new Date(m.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span></div></div>`);
+  }
+  box.innerHTML = renderedMessages.length ? renderedMessages.join('') : empty('No messages yet. Start the conversation.');
   box.scrollTop = box.scrollHeight;
   await supabase.from('messages').update({ read_at: new Date().toISOString() }).eq('sender_id', userId).eq('recipient_id', currentUser.id).is('read_at', null);
   $(`.friend-chat-item[data-chat-user="${userId}"] .conversation-unread`)?.remove();
@@ -636,7 +708,7 @@ function openProfileCropper(input, fieldName) {
       ctx.drawImage(image,state.x,state.y,image.naturalWidth*scale,image.naturalHeight*scale);
     };
     state.draw = draw; draw();
-    modal.querySelector('[data-crop-zoom]').addEventListener('input', e => { state.zoom=Number(e.target.value); const scale=baseScale*state.zoom; state.x=(width-image.naturalWidth*scale)/2; state.y=(height-image.naturalHeight*scale)/2; draw(); });
+    modal.querySelector('[data-crop-zoom]').addEventListener('input', e => { const oldScale=state.baseScale*state.zoom; const nextZoom=Number(e.target.value); const nextScale=state.baseScale*nextZoom; state.x=width/2-(width/2-state.x)*(nextScale/oldScale); state.y=height/2-(height/2-state.y)*(nextScale/oldScale); state.zoom=nextZoom; draw(); });
     canvas.addEventListener('pointerdown', e => { state.dragging=true; state.lastX=e.clientX; state.lastY=e.clientY; canvas.setPointerCapture(e.pointerId); });
     canvas.addEventListener('pointermove', e => { if(!state.dragging)return; const rect=canvas.getBoundingClientRect(); state.x+=(e.clientX-state.lastX)*width/rect.width; state.y+=(e.clientY-state.lastY)*width/rect.width; state.lastX=e.clientX; state.lastY=e.clientY; draw(); });
     canvas.addEventListener('pointerup', () => state.dragging=false);
@@ -722,9 +794,9 @@ async function searchUser(form) {
   if (error || !data) { box.innerHTML = `<p class="muted">${esc(error?.message || 'No public profile found with that username.')}</p>`; return; }
   if (data.id === currentUser.id) { box.innerHTML = '<p class="muted">That is your own profile.</p>'; return; }
   const { data: existing } = await supabase.from('friendships').select('id,status,requester_id,addressee_id').or(`and(requester_id.eq.${currentUser.id},addressee_id.eq.${data.id}),and(requester_id.eq.${data.id},addressee_id.eq.${currentUser.id})`).maybeSingle();
-  const action = existing ? `<span class="muted">Friendship: ${esc(existing.status)}</span>` : `<button class="button" data-add-friend="${data.id}">Send friend request</button>`;
+  const action = existing?.status === 'accepted' ? `<span class="relationship-label">Friends</span><button class="button" data-message-user="${data.id}">Message</button>` : existing?.status === 'pending' ? `<span class="muted">${existing.requester_id === currentUser.id ? 'Friend request sent' : 'Incoming friend request'}</span>` : existing ? `<span class="muted">${esc(existing.status)}</span>` : `<button class="button" data-add-friend="${data.id}">Add friend</button>`;
   const { data: following } = await supabase.from('follows').select('follower_id').eq('follower_id', currentUser.id).eq('followed_id', data.id).maybeSingle();
-  box.innerHTML = `<div class="search-person-result">${profileLink(data)} <div class="inline-actions">${action} ${following ? '<span class="muted">You follow this person</span>' : `<button class="button" data-follow-user="${data.id}">Follow</button>`}</div></div>`;
+  box.innerHTML = `<div class="search-person-result">${profileLink(data)} <div class="inline-actions">${action} <button class="button" data-toggle-follow="${data.id}">${following ? 'Unfollow' : 'Follow'}</button></div></div>`;
 }
 async function sendFriendRequest(id) {
   const { error } = await supabase.from('friendships').insert({ requester_id: currentUser.id, addressee_id: id, status: 'pending' });
@@ -762,11 +834,31 @@ async function submitMedia(form) {
 }
 async function submitMessage(form) {
   if (!activeChatUser) return toast('Choose a friend first.');
-  const body = String(new FormData(form).get('body') || '').trim();
-  if (!body) return;
-  const { error } = await supabase.from('messages').insert({ sender_id: currentUser.id, recipient_id: activeChatUser, body });
-  if (error) return toast(error.message);
-  form.reset(); openChat(activeChatUser);
+  const fd = new FormData(form);
+  const body = String(fd.get('body') || '').trim();
+  const file = form.querySelector('input[name="image"]')?.files?.[0] || null;
+  if (!body && !file) return toast('Write a message or attach an image.');
+  if (body.length > 5000) return toast('Messages must be 5,000 characters or fewer.');
+  let mediaPath = null;
+  if (file) {
+    const allowed = ['image/jpeg','image/png','image/webp','image/gif'];
+    if (!allowed.includes(file.type)) return toast('Use JPG, PNG, WEBP or GIF images.');
+    if (file.size > 10 * 1024 * 1024) return toast('Images must be 10 MB or smaller.');
+    const safeName = file.name.replace(/[^a-zA-Z0-9._-]/g, '_').slice(-100) || 'image';
+    mediaPath = `${currentUser.id}/${crypto.randomUUID()}-${safeName}`;
+    const upload = await supabase.storage.from('message-media').upload(mediaPath, file, { upsert: false, contentType: file.type, cacheControl: '3600' });
+    if (upload.error) return toast(upload.error.message);
+  }
+  const { error } = await supabase.from('messages').insert({ sender_id: currentUser.id, recipient_id: activeChatUser, body, media_path: mediaPath, media_type: file?.type || null, media_name: file?.name || null, media_size: file?.size || null });
+  if (error) {
+    if (mediaPath) await supabase.storage.from('message-media').remove([mediaPath]);
+    return toast(error.message);
+  }
+  if (messagePreviewUrl) URL.revokeObjectURL(messagePreviewUrl);
+  messagePreviewUrl = null;
+  form.reset();
+  const preview = $('#message-image-preview'); if (preview) { preview.hidden = true; preview.innerHTML = ''; }
+  await openChat(activeChatUser);
 }
 
 function updateThemeButton() {
@@ -827,10 +919,16 @@ document.addEventListener('click', async event => {
   if (event.target.closest('#theme-toggle') || event.target.closest('#settings-theme')) { toggleTheme(); return; }
   if (event.target.closest('#logout-button')) { stopRealtime(); await supabase.auth.signOut(); currentUser = null; currentProfile = null; showAuth(); return; }
   if (event.target.closest('[data-action="retry"]')) { renderView(); return; }
+  if (event.target.closest('[data-load-new-posts]')) { await renderHome(); window.scrollTo({ top: 0, behavior: 'smooth' }); return; }
+  if (event.target.closest('[data-toggle-emoji]')) { const picker = $('#message-emoji-picker'); if (picker) picker.hidden = !picker.hidden; return; }
+  const insertEmoji = event.target.closest('[data-insert-emoji]'); if (insertEmoji) { const input = $('#message-form input[name=body]'); if (input && !input.disabled) { const start = input.selectionStart ?? input.value.length; const end = input.selectionEnd ?? input.value.length; input.value = input.value.slice(0,start) + insertEmoji.dataset.insertEmoji + input.value.slice(end); input.focus(); const pos = start + insertEmoji.dataset.insertEmoji.length; input.setSelectionRange(pos,pos); } const picker = $('#message-emoji-picker'); if (picker) picker.hidden = true; return; }
   if (event.target.closest('[data-action="focus-post"]') || event.target.closest('[data-action="new-post"]')) { if (currentView !== 'posts') go('posts'); else $('#post-form textarea')?.focus(); return; }
   const delPost = event.target.closest('[data-delete-post]'); if (delPost) { if (!confirm('Delete this post?')) return; const postId = delPost.dataset.deletePost; const media = await supabase.from('post_media').select('storage_path').eq('post_id', postId); if (media.error) return toast(media.error.message); const paths = (media.data || []).map(x => x.storage_path); const removed = await supabase.from('posts').delete().eq('id', postId).eq('user_id', currentUser.id); if (removed.error) return toast(removed.error.message); if (paths.length) await supabase.storage.from('user-media').remove(paths); toast('Post deleted.'); renderView(); return; }
   const imageButton = event.target.closest('[data-post-image]'); if (imageButton) { openPostImage(imageButton); return; }
+  const chatImage = event.target.closest('[data-chat-image]'); if (chatImage) { openImageViewer([chatImage.dataset.chatImage]); return; }
+  if (event.target.closest('[data-remove-message-image]')) { const input = $('#message-form input[name="image"]'); if (input) input.value = ''; if (messagePreviewUrl) URL.revokeObjectURL(messagePreviewUrl); messagePreviewUrl = null; const preview = $('#message-image-preview'); if (preview) { preview.hidden = true; preview.innerHTML = ''; } return; }
   const likeButton = event.target.closest('[data-toggle-like]'); if (likeButton) { await togglePostLike(likeButton.dataset.toggleLike); return; }
+  const commentLike = event.target.closest('[data-toggle-comment-like]'); if (commentLike) { await toggleCommentLike(commentLike.dataset.toggleCommentLike); return; }
   const likesButton = event.target.closest('[data-show-likes]'); if (likesButton) { const list = $(`[data-likers="${likesButton.dataset.showLikes}"]`); if (list) list.hidden = !list.hidden; return; }
   const editComment = event.target.closest('[data-edit-comment]'); if (editComment) { const form = $(`[data-edit-comment-form="${editComment.dataset.editComment}"]`); if (form) { form.hidden = !form.hidden; if (!form.hidden) { const input = form.querySelector('input'); input.focus(); input.setSelectionRange(input.value.length,input.value.length); } } return; }
   const replyButton = event.target.closest('[data-reply-comment]'); if (replyButton) { const form = $(`[data-reply-form="${replyButton.dataset.replyComment}"]`); if (form) { form.hidden = !form.hidden; if (!form.hidden) form.querySelector('input')?.focus(); } return; }
@@ -838,7 +936,8 @@ document.addEventListener('click', async event => {
   const openProfile = event.target.closest('[data-open-profile]'); if (openProfile) { viewedProfileId = openProfile.dataset.openProfile; go('public-profile'); return; }
   const add = event.target.closest('[data-add-friend]'); if (add) { await sendFriendRequest(add.dataset.addFriend); return; }
   const accept = event.target.closest('[data-accept-friend]'); if (accept) { await acceptFriend(accept.dataset.acceptFriend); return; }
-  const follow = event.target.closest('[data-follow-user]'); if (follow) { const { error } = await supabase.from('follows').insert({ follower_id: currentUser.id, followed_id: follow.dataset.followUser }); toast(error ? error.message : 'You are now following this person.'); if (!error) renderView(); return; }
+  const follow = event.target.closest('[data-toggle-follow]'); if (follow) { const targetId = follow.dataset.toggleFollow; follow.disabled = true; const existing = await supabase.from('follows').select('follower_id').eq('follower_id', currentUser.id).eq('followed_id', targetId).maybeSingle(); if (existing.error) { follow.disabled = false; return toast(existing.error.message); } const result = existing.data ? await supabase.from('follows').delete().eq('follower_id', currentUser.id).eq('followed_id', targetId) : await supabase.from('follows').insert({ follower_id: currentUser.id, followed_id: targetId }); if (result.error) { follow.disabled = false; return toast(result.error.message); } follow.textContent = existing.data ? 'Follow' : 'Unfollow'; follow.disabled = false; toast(existing.data ? 'You unfollowed this person.' : 'You are now following this person.'); return; }
+  const messageUser = event.target.closest('[data-message-user]'); if (messageUser) { const targetId = messageUser.dataset.messageUser; await go('messages'); await openChat(targetId); return; }
   const friendTab = event.target.closest('[data-friend-tab]'); if (friendTab) { $$('[data-friend-tab]').forEach(b => b.classList.toggle('active', b === friendTab)); $$('[data-friend-section]').forEach(panel => { panel.hidden = panel.dataset.friendSection !== friendTab.dataset.friendTab; }); return; }
   const decline = event.target.closest('[data-decline-friend], [data-cancel-friend]'); if (decline) { const id = decline.dataset.declineFriend || decline.dataset.cancelFriend; if (!confirm(decline.hasAttribute('data-decline-friend') ? 'Decline this friend request?' : 'Cancel this sent request?')) return; const { error } = await supabase.from('friendships').delete().eq('id', id); toast(error ? error.message : 'Request removed.'); if (!error) renderView(); return; }
   const chat = event.target.closest('[data-chat-user]'); if (chat) { await openChat(chat.dataset.chatUser); return; }
@@ -858,6 +957,7 @@ document.addEventListener('input', event => {
 document.addEventListener('change', event => {
   const input = event.target;
   if (input.matches('#post-form input[name="images"]')) { const preview = $('#post-image-preview'); const files = [...(input.files || [])]; if (files.length > 5) { toast('You can add up to 5 images.'); input.value = ''; preview.innerHTML = ''; return; } preview.innerHTML = files.map(file => `<span>${esc(file.name)}</span>`).join(''); }
+  else if (input.matches('#message-form input[name="image"]')) { const file = input.files?.[0]; const preview = $('#message-image-preview'); if (messagePreviewUrl) URL.revokeObjectURL(messagePreviewUrl); messagePreviewUrl = null; if (!file) { if (preview) { preview.hidden = true; preview.innerHTML = ''; } return; } if (!['image/jpeg','image/png','image/webp','image/gif'].includes(file.type) || file.size > 10 * 1024 * 1024) { toast('Choose a JPG, PNG, WEBP or GIF image up to 10 MB.'); input.value = ''; if (preview) { preview.hidden = true; preview.innerHTML = ''; } return; } messagePreviewUrl = URL.createObjectURL(file); if (preview) { preview.innerHTML = `<img src="${messagePreviewUrl}" alt="Image preview"><span>${esc(file.name)}</span><button type="button" class="text-button" data-remove-message-image>Remove</button>`; preview.hidden = false; } }
   else if (input.matches('#avatar-upload-form input[type=file]')) openProfileCropper(input, 'avatar_url');
   else if (input.matches('#cover-upload-form input[type=file]')) openProfileCropper(input, 'cover_url');
 });
