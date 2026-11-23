@@ -104,6 +104,7 @@ function scheduleRealtimeRefresh(payload) {
     return;
   }
   if (table === 'posts') relevant = (currentView === 'home') || (currentView === 'posts' && row.user_id === currentUser.id) || (currentView === 'public-profile' && row.user_id === viewedProfileId);
+  else if (['post_media','post_likes','post_comments'].includes(table)) relevant = ['home','posts','public-profile'].includes(currentView);
   else if (table === 'friendships' || table === 'follows') relevant = currentView === 'friends' || currentView === 'public-profile';
   else if (table === 'profiles') relevant = (currentView === 'profile' && row.id === currentUser.id) || (currentView === 'public-profile' && row.id === viewedProfileId);
   else if (table === 'media_items') relevant = (row.user_id === currentUser.id) && ['images','videos','audio'].includes(currentView);
@@ -208,7 +209,7 @@ function startRealtime(userId) {
   if (!supabase || !userId) return;
   stopRealtime();
   initNotificationUI();
-  const tables = ['profiles','posts','friendships','follows','messages','media_items','projects','movies','recommendations'];
+  const tables = ['profiles','posts','post_media','post_likes','post_comments','friendships','follows','messages','media_items','projects','movies','recommendations'];
   let channel = supabase.channel(`personal-space-live-${userId}`);
   for (const table of tables) {
     channel = channel.on('postgres_changes', { event: '*', schema: 'public', table }, payload => {
@@ -240,16 +241,108 @@ async function renderView() {
     if (token === renderToken) viewContainer.innerHTML = pageHead(titles[currentView], 'We could not load this section.') + `<p class="error-text">${esc(errorText(error))}</p><button class="button" data-action="retry">Try again</button>`;
   }
 }
+async function buildPostCards(posts, { allowDelete = false } = {}) {
+  if (!posts?.length) return empty('No posts to show yet.');
+  const postIds = posts.map(p => p.id);
+  const userIds = [...new Set(posts.map(p => p.user_id))];
+  const [mediaResult, likesResult, commentsResult, profilesResult] = await Promise.all([
+    supabase.from('post_media').select('id,post_id,user_id,storage_path,position').in('post_id', postIds).order('position', { ascending: true }),
+    supabase.from('post_likes').select('post_id,user_id').in('post_id', postIds),
+    supabase.from('post_comments').select('id,post_id,user_id,parent_comment_id,body,created_at').in('post_id', postIds).order('created_at', { ascending: true }),
+    supabase.from('profiles').select('id,username,display_name,avatar_url').in('id', userIds)
+  ]);
+  for (const result of [mediaResult, likesResult, commentsResult, profilesResult]) if (result.error) throw result.error;
+  const mediaByPost = {};
+  await Promise.all((mediaResult.data || []).map(async item => {
+    const signed = await supabase.storage.from('user-media').createSignedUrl(item.storage_path, 3600);
+    if (signed.error) throw signed.error;
+    (mediaByPost[item.post_id] ||= []).push({ ...item, url: signed.data.signedUrl });
+  }));
+  const extraIds = [...new Set([...(commentsResult.data || []).map(comment => comment.user_id), ...(likesResult.data || []).map(like => like.user_id)])].filter(id => !userIds.includes(id));
+  let extraProfiles = [];
+  if (extraIds.length) { const extra = await supabase.from('profiles').select('id,username,display_name,avatar_url').in('id', extraIds); if (extra.error) throw extra.error; extraProfiles = extra.data || []; }
+  const profileById = Object.fromEntries([...(profilesResult.data || []), ...extraProfiles].map(person => [person.id, person]));
+  const likesByPost = {};
+  for (const like of likesResult.data || []) {
+    const item = (likesByPost[like.post_id] ||= { count: 0, mine: false });
+    item.count++;
+    if (like.user_id === currentUser.id) item.mine = true;
+  }
+  const likersByPost = {};
+  for (const like of likesResult.data || []) (likersByPost[like.post_id] ||= []).push(profileById[like.user_id] || { id: like.user_id, display_name: 'Member', username: 'unknown' });
+  const commentsByPost = {};
+  for (const comment of commentsResult.data || []) (commentsByPost[comment.post_id] ||= []).push(comment);
+  const commentMarkup = (comment, all, depth = 0) => {
+    const person = profileById[comment.user_id] || { id: comment.user_id, display_name: 'Member', username: 'unknown' };
+    const replies = all.filter(x => x.parent_comment_id === comment.id);
+    return `<div class="post-comment${depth ? ' post-reply' : ''}"><div class="comment-head">${profileLink(person)}<span class="post-meta">${new Date(comment.created_at).toLocaleString()}</span></div><p class="comment-body">${esc(comment.body)}</p><div class="comment-actions">${depth === 0 ? `<button class="text-button" type="button" data-reply-comment="${comment.id}" data-post-id="${comment.post_id}">Reply</button>` : ''}${comment.user_id === currentUser.id ? `<button class="text-button" type="button" data-edit-comment="${comment.id}">Edit</button><button class="text-button" type="button" data-delete-comment="${comment.id}" data-post-id="${comment.post_id}">Delete</button>` : ''}</div>${comment.user_id === currentUser.id ? `<form class="edit-comment-form" data-edit-comment-form="${comment.id}" hidden><input name="body" maxlength="2000" value="${esc(comment.body)}" required><button class="button" type="submit">Save</button></form>` : ''}<form class="reply-form" data-reply-form="${comment.id}" data-post-id="${comment.post_id}" hidden><input name="body" maxlength="2000" placeholder="Write a reply…" required><button class="button" type="submit">Reply</button></form>${depth === 0 && replies.length ? `<div class="comment-replies">${replies.map(reply => commentMarkup(reply, all, 1)).join('')}</div>` : ''}</div>`;
+  };
+  return `<div class="post-feed">${posts.map(post => {
+    const author = profileById[post.user_id] || { id: post.user_id, display_name: 'Member', username: 'unknown' };
+    const media = mediaByPost[post.id] || [];
+    const gallery = media.length ? `<div class="post-gallery ${media.length === 1 ? 'single-image' : 'multi-image'}">${media.map((item, index) => `<button type="button" class="post-image-open" data-post-image="${esc(item.url)}" data-post-id="${post.id}" data-image-index="${index}" aria-label="Open image ${index + 1} of ${media.length}"><img src="${esc(item.url)}" alt="Post image ${index + 1}" loading="lazy"></button>`).join('')}</div>` : '';
+    const like = likesByPost[post.id] || { count: 0, mine: false };
+    const comments = commentsByPost[post.id] || [];
+    const roots = comments.filter(c => !c.parent_comment_id);
+    return `<article class="post-card" data-post-card="${post.id}"><div class="post-card-head">${profileLink(author)}<div class="post-head-meta"><span class="post-meta">${new Date(post.created_at).toLocaleString()}</span><span class="post-visibility">${esc(post.visibility)}</span></div>${allowDelete && post.user_id === currentUser.id ? `<button type="button" class="text-button" data-delete-post="${post.id}">Delete</button>` : ''}</div>${post.body ? `<p class="post-body">${esc(post.body)}</p>` : ''}${gallery}<div class="post-engagement"><button type="button" class="text-button like-button${like.mine ? ' liked' : ''}" data-toggle-like="${post.id}" aria-pressed="${like.mine}">${like.mine ? '♥ Liked' : '♡ Like'}</button><button type="button" class="text-button likes-count" data-show-likes="${post.id}" ${like.count ? '' : 'disabled'}>${like.count} ${like.count === 1 ? 'like' : 'likes'}</button><span class="post-meta">${comments.length} ${comments.length === 1 ? 'comment' : 'comments'}</span></div><div class="post-likers" data-likers="${post.id}" hidden>${(likersByPost[post.id] || []).map(person => profileLink(person)).join('')}</div><div class="post-comments">${roots.map(c => commentMarkup(c, comments)).join('')}<form class="comment-form" data-comment-form="${post.id}"><input name="body" maxlength="2000" placeholder="Write a comment…" required><button class="button" type="submit">Comment</button></form></div></article>`;
+  }).join('')}</div>`;
+}
+function openPostImage(button) {
+  const gallery = button.closest('.post-gallery');
+  const images = [...(gallery?.querySelectorAll('[data-post-image]') || [])].map(el => el.dataset.postImage);
+  if (!images.length) return;
+  let index = Number(button.dataset.imageIndex) || 0;
+  const modal = document.createElement('div');
+  modal.className = 'image-viewer-backdrop';
+  modal.innerHTML = `<div class="image-viewer" role="dialog" aria-modal="true" aria-label="Image viewer"><button type="button" class="image-viewer-close" aria-label="Close image">×</button><button type="button" class="image-viewer-prev" aria-label="Previous image" ${images.length < 2 ? 'hidden' : ''}>‹</button><img class="image-viewer-image" alt="Enlarged post image"><button type="button" class="image-viewer-next" aria-label="Next image" ${images.length < 2 ? 'hidden' : ''}>›</button><span class="image-viewer-count"></span></div>`;
+  const img = modal.querySelector('img');
+  const count = modal.querySelector('.image-viewer-count');
+  const show = () => { img.src = images[index]; count.textContent = `${index + 1} / ${images.length}`; };
+  const close = () => { modal.remove(); document.removeEventListener('keydown', keyHandler); };
+  const prev = () => { index = (index - 1 + images.length) % images.length; show(); };
+  const next = () => { index = (index + 1) % images.length; show(); };
+  const keyHandler = e => { if (e.key === 'Escape') close(); if (e.key === 'ArrowLeft' && images.length > 1) prev(); if (e.key === 'ArrowRight' && images.length > 1) next(); };
+  modal.addEventListener('click', e => { if (e.target === modal || e.target.closest('.image-viewer-close')) close(); });
+  modal.querySelector('.image-viewer-prev').addEventListener('click', prev);
+  modal.querySelector('.image-viewer-next').addEventListener('click', next);
+  document.addEventListener('keydown', keyHandler);
+  document.body.append(modal); show();
+}
+async function togglePostLike(postId) {
+  const existing = await supabase.from('post_likes').select('post_id').eq('post_id', postId).eq('user_id', currentUser.id).maybeSingle();
+  if (existing.error) return toast(existing.error.message);
+  const result = existing.data
+    ? await supabase.from('post_likes').delete().eq('post_id', postId).eq('user_id', currentUser.id)
+    : await supabase.from('post_likes').insert({ post_id: postId, user_id: currentUser.id });
+  if (result.error) return toast(result.error.message);
+  renderView();
+}
+async function submitPostComment(form) {
+  const postId = form.dataset.commentForm || form.dataset.postId;
+  const parentId = form.dataset.parentComment || form.dataset.replyForm || null;
+  const body = String(new FormData(form).get('body') || '').trim();
+  if (!body) return;
+  const { error } = await supabase.from('post_comments').insert({ post_id: postId, user_id: currentUser.id, parent_comment_id: parentId, body });
+  if (error) return toast(error.message);
+  toast(parentId ? 'Reply added.' : 'Comment added.');
+  renderView();
+}
+async function submitEditComment(form) {
+  const id = form.dataset.editCommentForm;
+  const body = String(new FormData(form).get('body') || '').trim();
+  if (!body) return;
+  const { error } = await supabase.from('post_comments').update({ body, updated_at: new Date().toISOString() }).eq('id', id).eq('user_id', currentUser.id);
+  if (error) return toast(error.message);
+  toast('Comment updated.'); renderView();
+}
+
 async function renderHome() {
-  const { data: posts, error } = await supabase.from('posts').select('id,body,visibility,created_at,user_id').order('created_at', { ascending: false }).limit(10);
+  const { data: posts, error } = await supabase.from('posts').select('id,user_id,body,visibility,created_at').order('created_at', { ascending: false }).limit(20);
   if (error) throw error;
-  const ids = [...new Set((posts || []).map(p => p.user_id))];
-  let profiles = [];
-  if (ids.length) { const result = await supabase.from('profiles').select('id,display_name,username,avatar_url').in('id', ids); if (!result.error) profiles = result.data || []; }
-  const byId = Object.fromEntries(profiles.map(p => [p.id, p]));
+  const cards = await buildPostCards(posts || []);
   viewContainer.innerHTML = pageHead('Welcome back', `Your space, ${currentProfile.display_name}.`, '<button class="button primary" data-action="new-post">Write a post</button>') +
     `<div class="stat-line"><span>@${esc(currentProfile.username)}</span><span>${esc(currentProfile.bio || 'Add a short bio in your profile.')}</span></div>` +
-    section('Recent public posts', posts?.length ? `<ul class="plain-list">${posts.map(p => `<li>${profileLink({id:p.user_id,...(byId[p.user_id]||{})})}<p class="post-body">${esc(p.body)}</p><span class="post-meta">${new Date(p.created_at).toLocaleString()} · ${esc(p.visibility)}</span></li>`).join('')}</ul>` : empty('No posts to show yet.')) +
+    section('Recent posts', cards) +
     section('Your space', '<p>Use the navigation to manage your profile, posts, connections, messages, media and personal collections.</p>');
 }
 async function renderProfile() {
@@ -272,7 +365,7 @@ async function renderPublicProfile() {
     return;
   }
   const [{ data: posts, error: postError }, { data: friendship }, { data: following }] = await Promise.all([
-    supabase.from('posts').select('id,body,visibility,created_at').eq('user_id', person.id).order('created_at', { ascending: false }).limit(50),
+    supabase.from('posts').select('id,user_id,body,visibility,created_at').eq('user_id', person.id).order('created_at', { ascending: false }).limit(50),
     supabase.from('friendships').select('id,status,requester_id,addressee_id').or(`and(requester_id.eq.${currentUser.id},addressee_id.eq.${person.id}),and(requester_id.eq.${person.id},addressee_id.eq.${currentUser.id})`).maybeSingle(),
     supabase.from('follows').select('follower_id').eq('follower_id', currentUser.id).eq('followed_id', person.id).maybeSingle()
   ]);
@@ -285,7 +378,7 @@ async function renderPublicProfile() {
   const followAction = following ? '<span class="muted">You follow this person</span>' : `<button class="button" data-follow-user="${person.id}">Follow</button>`;
   const websiteUrl = safeHttpUrl(person.website);
   const website = websiteUrl ? `<p><a href="${esc(websiteUrl)}" target="_blank" rel="noopener noreferrer">${esc(person.website)}</a></p>` : '';
-  const postRows = posts?.length ? `<ul class="plain-list">${posts.map(post => `<li><p class="post-body">${esc(post.body)}</p><span class="post-meta">${new Date(post.created_at).toLocaleString()} · ${esc(post.visibility)}</span></li>`).join('')}</ul>` : empty('No posts are available to view.');
+  const postRows = await buildPostCards(posts || []);
   const joined = person.created_at ? `Member since ${new Date(person.created_at).toLocaleDateString()}` : '';
   viewContainer.innerHTML = pageHead('Member profile', `A look at what ${person.display_name} has chosen to share.`, '<button class="button" data-view="friends">Back to people</button>') + cover +
     `<div class="profile-header"><div class="avatar">${avatar}</div><div><h2>${esc(person.display_name)}</h2><p class="muted">@${esc(person.username)}</p><p>${esc(person.bio || 'No biography added.')}</p>${website}<p class="post-meta">${esc(joined)}</p><div class="inline-actions">${friendshipAction}${followAction}</div></div></div>` +
@@ -293,11 +386,12 @@ async function renderPublicProfile() {
 }
 
 async function renderPosts() {
-  const { data: posts, error } = await supabase.from('posts').select('*').eq('user_id', currentUser.id).order('created_at', { ascending: false });
+  const { data: posts, error } = await supabase.from('posts').select('id,user_id,body,visibility,created_at').eq('user_id', currentUser.id).order('created_at', { ascending: false });
   if (error) throw error;
-  viewContainer.innerHTML = pageHead('My posts', 'Write and manage your publications.', '<button class="button primary" data-action="focus-post">New post</button>') +
-    `<form id="post-form" class="content-form"><h3>Write something</h3><label>Post<textarea name="body" required maxlength="10000" placeholder="What’s on your mind?"></textarea></label><label>Who can see this?<select name="visibility"><option value="public">Public</option><option value="friends">Friends only</option><option value="private">Private</option></select></label><button class="button primary" type="submit">Publish post</button></form>` +
-    section('Published posts', posts.length ? `<ul class="plain-list">${posts.map(p => `<li><div class="row-between"><span class="post-meta">${new Date(p.created_at).toLocaleString()} · ${esc(p.visibility)}</span><button class="text-button" data-delete-post="${p.id}">Delete</button></div><p class="post-body">${esc(p.body)}</p></li>`).join('')}</ul>` : empty('You have not published anything yet.'));
+  const cards = await buildPostCards(posts || [], { allowDelete: true });
+  viewContainer.innerHTML = pageHead('My posts', 'Share words, photographs or both.', '<button class="button primary" data-action="focus-post">New post</button>') +
+    `<form id="post-form" class="content-form"><h3>Write something</h3><label>Post<textarea name="body" maxlength="10000" placeholder="What’s on your mind?"></textarea></label><label>Add images<input name="images" type="file" accept="image/jpeg,image/png,image/webp,image/gif" multiple></label><small class="muted">Choose up to 5 images. Each image can be up to 10 MB. You can publish an image without text.</small><div id="post-image-preview" class="post-image-preview"></div><label>Who can see this?<select name="visibility"><option value="public">Public</option><option value="friends">Friends only</option><option value="private">Private</option></select></label><button class="button primary" type="submit">Publish post</button></form>` +
+    section('Published posts', cards);
 }
 async function renderFriends() {
   const { data: links, error } = await supabase.from('friendships').select('*').or(`requester_id.eq.${currentUser.id},addressee_id.eq.${currentUser.id}`).order('created_at', { ascending: false });
@@ -547,9 +641,39 @@ async function submitProfileImage(form, fieldName) {
 }
 async function submitPost(form) {
   const fd = new FormData(form);
-  const { error } = await supabase.from('posts').insert({ user_id: currentUser.id, body: String(fd.get('body')).trim(), visibility: fd.get('visibility') });
-  if (error) return toast(error.message);
-  toast('Post published.'); renderPosts();
+  const body = String(fd.get('body') || '').trim();
+  const files = [...(form.querySelector('[name="images"]')?.files || [])];
+  if (!body && !files.length) return toast('Write something or choose at least one image.');
+  if (files.length > 5) return toast('You can add up to 5 images to one post.');
+  const allowed = ['image/jpeg','image/png','image/webp','image/gif'];
+  for (const file of files) {
+    if (!allowed.includes(file.type)) return toast('Use JPG, PNG, WEBP or GIF images.');
+    if (file.size > 10 * 1024 * 1024) return toast('Each image must be 10 MB or smaller.');
+  }
+  setBusy(form, true, 'Publishing…');
+  let postId = null;
+  const uploaded = [];
+  try {
+    const inserted = await supabase.from('posts').insert({ user_id: currentUser.id, body: body || null, visibility: fd.get('visibility') }).select('id').single();
+    if (inserted.error) throw inserted.error;
+    postId = inserted.data.id;
+    for (let index = 0; index < files.length; index++) {
+      const file = files[index];
+      const extension = ({'image/jpeg':'jpg','image/png':'png','image/webp':'webp','image/gif':'gif'})[file.type];
+      const path = `${currentUser.id}/posts/${postId}/${crypto.randomUUID()}.${extension}`;
+      const upload = await supabase.storage.from('user-media').upload(path, file, { upsert: false, contentType: file.type, cacheControl: '3600' });
+      if (upload.error) throw upload.error;
+      uploaded.push(path);
+      const saved = await supabase.from('post_media').insert({ post_id: postId, user_id: currentUser.id, storage_path: path, mime_type: file.type, file_size: file.size, position: index });
+      if (saved.error) throw saved.error;
+    }
+    toast('Post published.');
+    await renderPosts();
+  } catch (error) {
+    if (uploaded.length) await supabase.storage.from('user-media').remove(uploaded);
+    if (postId) await supabase.from('posts').delete().eq('id', postId).eq('user_id', currentUser.id);
+    throw error;
+  } finally { setBusy(form, false); }
 }
 async function searchUser(form) {
   const username = String(new FormData(form).get('username')).trim().replace(/^@/, '').toLowerCase();
@@ -664,7 +788,13 @@ document.addEventListener('click', async event => {
   if (event.target.closest('#logout-button')) { stopRealtime(); await supabase.auth.signOut(); currentUser = null; currentProfile = null; showAuth(); return; }
   if (event.target.closest('[data-action="retry"]')) { renderView(); return; }
   if (event.target.closest('[data-action="focus-post"]') || event.target.closest('[data-action="new-post"]')) { if (currentView !== 'posts') go('posts'); else $('#post-form textarea')?.focus(); return; }
-  const delPost = event.target.closest('[data-delete-post]'); if (delPost) { if (!confirm('Delete this post?')) return; const { error } = await supabase.from('posts').delete().eq('id', delPost.dataset.deletePost).eq('user_id', currentUser.id); toast(error ? error.message : 'Post deleted.'); if (!error) renderPosts(); return; }
+  const delPost = event.target.closest('[data-delete-post]'); if (delPost) { if (!confirm('Delete this post?')) return; const postId = delPost.dataset.deletePost; const media = await supabase.from('post_media').select('storage_path').eq('post_id', postId); if (media.error) return toast(media.error.message); const paths = (media.data || []).map(x => x.storage_path); const removed = await supabase.from('posts').delete().eq('id', postId).eq('user_id', currentUser.id); if (removed.error) return toast(removed.error.message); if (paths.length) await supabase.storage.from('user-media').remove(paths); toast('Post deleted.'); renderView(); return; }
+  const imageButton = event.target.closest('[data-post-image]'); if (imageButton) { openPostImage(imageButton); return; }
+  const likeButton = event.target.closest('[data-toggle-like]'); if (likeButton) { await togglePostLike(likeButton.dataset.toggleLike); return; }
+  const likesButton = event.target.closest('[data-show-likes]'); if (likesButton) { const list = $(`[data-likers="${likesButton.dataset.showLikes}"]`); if (list) list.hidden = !list.hidden; return; }
+  const editComment = event.target.closest('[data-edit-comment]'); if (editComment) { const form = $(`[data-edit-comment-form="${editComment.dataset.editComment}"]`); if (form) { form.hidden = !form.hidden; if (!form.hidden) { const input = form.querySelector('input'); input.focus(); input.setSelectionRange(input.value.length,input.value.length); } } return; }
+  const replyButton = event.target.closest('[data-reply-comment]'); if (replyButton) { const form = $(`[data-reply-form="${replyButton.dataset.replyComment}"]`); if (form) { form.hidden = !form.hidden; if (!form.hidden) form.querySelector('input')?.focus(); } return; }
+  const deleteComment = event.target.closest('[data-delete-comment]'); if (deleteComment) { if (!confirm('Delete this comment?')) return; const { error } = await supabase.from('post_comments').delete().eq('id', deleteComment.dataset.deleteComment).eq('user_id', currentUser.id); if (error) toast(error.message); else { toast('Comment deleted.'); renderView(); } return; }
   const openProfile = event.target.closest('[data-open-profile]'); if (openProfile) { viewedProfileId = openProfile.dataset.openProfile; go('public-profile'); return; }
   const add = event.target.closest('[data-add-friend]'); if (add) { await sendFriendRequest(add.dataset.addFriend); return; }
   const accept = event.target.closest('[data-accept-friend]'); if (accept) { await acceptFriend(accept.dataset.acceptFriend); return; }
@@ -676,7 +806,8 @@ document.addEventListener('click', async event => {
 });
 document.addEventListener('change', event => {
   const input = event.target;
-  if (input.matches('#avatar-upload-form input[type=file]')) openProfileCropper(input, 'avatar_url');
+  if (input.matches('#post-form input[name="images"]')) { const preview = $('#post-image-preview'); const files = [...(input.files || [])]; if (files.length > 5) { toast('You can add up to 5 images.'); input.value = ''; preview.innerHTML = ''; return; } preview.innerHTML = files.map(file => `<span>${esc(file.name)}</span>`).join(''); }
+  else if (input.matches('#avatar-upload-form input[type=file]')) openProfileCropper(input, 'avatar_url');
   else if (input.matches('#cover-upload-form input[type=file]')) openProfileCropper(input, 'cover_url');
 });
 
@@ -690,6 +821,8 @@ document.addEventListener('submit', async event => {
     else if (form.id === 'avatar-upload-form') await submitProfileImage(form, 'avatar_url');
     else if (form.id === 'cover-upload-form') await submitProfileImage(form, 'cover_url');
     else if (form.id === 'post-form') await submitPost(form);
+    else if (form.matches('[data-comment-form], [data-reply-form]')) await submitPostComment(form);
+    else if (form.matches('[data-edit-comment-form]')) await submitEditComment(form);
     else if (form.id === 'user-search') await searchUser(form);
     else if (form.id === 'collection-form') await submitCollection(form);
     else if (form.id === 'media-form') await submitMedia(form);
