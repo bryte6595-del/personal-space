@@ -1,6 +1,6 @@
 export const pageRoutes = {
   home:'index.html', profile:'profile.html', 'public-profile':'profile.html', posts:'posts.html',
-  friends:'friends.html', messages:'messages.html', images:'media.html', videos:'media.html',
+  friends:'friends.html', messages:'chats.html', images:'media.html', videos:'media.html',
   audio:'media.html', projects:'projects.html', movies:'movies.html',
   recommendations:'recommendations.html', settings:'settings.html'
 };
@@ -15,7 +15,7 @@ export function viewFromLocation(titles) {
   }
   const map = {
     'index.html':'home', 'profile.html':'profile', 'posts.html':'posts',
-    'friends.html':'friends', 'messages.html':'messages', 'projects.html':'projects',
+    'friends.html':'friends', 'chats.html':'messages', 'messages.html':'messages', 'projects.html':'projects',
     'movies.html':'movies', 'recommendations.html':'recommendations', 'settings.html':'settings'
   };
   if (map[path]) return map[path];

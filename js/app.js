@@ -7,7 +7,7 @@ const $$ = (s, root = document) => [...root.querySelectorAll(s)];
 const authScreen = $('#auth-screen');
 const app = $('#app');
 const viewContainer = $('#view-container');
-const titles = { home:'Home', profile:'My profile', 'public-profile':'Member profile', posts:'Posts', friends:'Friends & followers', messages:'Messages', images:'Images', videos:'Videos', audio:'Audio', projects:'Projects & games', movies:'Movies', recommendations:'Recommendations', settings:'Settings' };
+const titles = { home:'Home', profile:'My profile', 'public-profile':'Member profile', posts:'Posts', friends:'Friends & followers', messages:'Chats', images:'Images', videos:'Videos', audio:'Audio', projects:'Projects & games', movies:'Movies', recommendations:'Recommendations', settings:'Settings' };
 const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 function safeHttpUrl(value) { try { const url = new URL(String(value), location.origin); return ['http:', 'https:'].includes(url.protocol) ? url.href : ''; } catch { return ''; } }
 let supabase;
@@ -19,6 +19,7 @@ let chatProfiles = {};
 let viewedProfileId = new URLSearchParams(location.search).get('member');
 let renderToken = 0;
 let realtimeChannel = null;
+let realtimeUserId = null;
 let presenceChannel = null;
 let onlineUserIds = new Set();
 let realtimeRefreshTimer = null;
@@ -105,6 +106,7 @@ function stopRealtime() {
   if (presenceChannel) supabase.removeChannel(presenceChannel);
   presenceChannel = null;
   onlineUserIds = new Set();
+  realtimeUserId = null;
 }
 function updatePresenceDots() {
   $$('[data-presence-user]').forEach(dot => {
@@ -128,7 +130,7 @@ function scheduleRealtimeRefresh(payload) {
         realtimeRefreshTimer = null;
         if (!currentUser || currentView !== 'messages') return;
         if (activeChatUser === otherId) openChat(otherId);
-        else renderMessages();
+        else renderChats();
       }, 250);
     }
     return;
@@ -218,7 +220,7 @@ async function loadNotificationPanel() {
   if (ids.length) { const result = await supabase.from('profiles').select('id,display_name,username,avatar_url').in('id', ids); if (!result.error) profiles = result.data || []; }
   const names = Object.fromEntries(profiles.map(x => [x.id, x.display_name || x.username || 'Member']));
   const group = (title, rows, renderer) => rows.length ? `<div class="notification-group"><h4>${title}</h4>${rows.map(renderer).join('')}</div>` : '';
-  const messageHtml = group('Unread messages', messages.data || [], x => `<button class="notification-item" data-notification-chat="${x.sender_id}">New message from <strong>${esc(names[x.sender_id] || 'Member')}</strong><small>${esc(String(x.body || (x.media_path ? '📷 Image attachment' : '')).slice(0,90))} · ${new Date(x.created_at).toLocaleString()}</small></button>`);
+  const messageHtml = group('Unread chats', messages.data || [], x => `<button class="notification-item" data-notification-chat="${x.sender_id}">New message from <strong>${esc(names[x.sender_id] || 'Member')}</strong><small>${esc(String(x.body || (x.media_path ? '📷 Image attachment' : '')).slice(0,90))} · ${new Date(x.created_at).toLocaleString()}</small></button>`);
   const requestHtml = group('Friend requests', requests.data || [], x => `<button class="notification-item" data-notification-friends="${x.id}"><strong>${esc(names[x.requester_id] || 'Someone')}</strong> sent you a friend request<small>${new Date(x.created_at).toLocaleString()}</small></button>`);
   const postHtml = group('New posts from people you follow', posts.data || [], x => `<button class="notification-item" data-notification-post="${x.user_id}" data-post-created="${esc(x.created_at)}"><strong>${esc(names[x.user_id] || 'Member')}</strong> published a post<small>${esc(String(x.body || '').slice(0,90))} · ${new Date(x.created_at).toLocaleString()}</small></button>`);
   content.innerHTML = messageHtml + requestHtml + postHtml || '<p class="notification-empty">You are all caught up.</p>';
@@ -246,7 +248,9 @@ async function handleRealtimeNotification(payload) {
 }
 function startRealtime(userId) {
   if (!supabase || !userId) return;
+  if (realtimeUserId === userId && realtimeChannel) return;
   stopRealtime();
+  realtimeUserId = userId;
   initNotificationUI();
   const tables = ['profiles','posts','post_media','post_likes','post_comments','post_comment_likes','friendships','follows','messages','media_items','projects','movies','recommendations'];
   let channel = supabase.channel(`personal-space-live-${userId}`);
@@ -285,12 +289,14 @@ async function renderView() {
   document.title = `${titles[currentView] || 'Home'} | Personal Space`;
   if (!currentUser) return showAuth();
   const token = ++renderToken;
-  viewContainer.classList.remove('messages-view', 'has-active-chat');
+  viewContainer.classList.remove('messages-view', 'has-active-chat', 'home-view');
+  $$('.nav-link').forEach(a => a.classList.toggle('active', a.dataset.view === currentView || (currentView === 'public-profile' && a.dataset.view === 'profile')));
+  $('#breadcrumb').textContent = titles[currentView] || 'Home';
   viewContainer.innerHTML = '<p class="muted">Loading…</p>';
   try {
     await loadProfile();
     if (token !== renderToken) return;
-    const pages = { home: renderHome, profile: renderProfile, 'public-profile': renderPublicProfile, posts: renderPosts, friends: renderFriends, messages: renderMessages, images: () => renderMedia('image'), videos: () => renderMedia('video'), audio: () => renderMedia('audio'), projects: () => renderCollection('projects'), movies: () => renderCollection('movies'), recommendations: () => renderCollection('recommendations'), settings: renderSettings };
+    const pages = { home: renderHome, profile: renderProfile, 'public-profile': renderPublicProfile, posts: renderPosts, friends: renderFriends, messages: renderChats, images: () => renderMedia('image'), videos: () => renderMedia('video'), audio: () => renderMedia('audio'), projects: () => renderCollection('projects'), movies: () => renderCollection('movies'), recommendations: () => renderCollection('recommendations'), settings: renderSettings };
     await (pages[currentView] || renderHome)();
   } catch (error) {
     if (token === renderToken) viewContainer.innerHTML = pageHead(titles[currentView], 'We could not load this section.') + `<p class="error-text">${esc(errorText(error))}</p><button class="button" data-action="retry">Try again</button>`;
@@ -436,21 +442,23 @@ async function submitEditComment(form) {
 }
 
 async function renderHome() {
-  const { data: posts, error } = await supabase.from('posts').select('id,user_id,body,visibility,created_at').order('created_at', { ascending: false }).limit(20);
+  const { data: posts, error } = await supabase.from('posts').select('id,user_id,body,visibility,created_at').order('created_at', { ascending: false }).limit(8);
   if (error) throw error;
   const cards = await buildPostCards(posts || []);
   const shortcuts = [
     ['profile','My profile','Edit your details and profile images','◉'],
     ['friends','Friends','Manage connections and requests','♧'],
-    ['messages','Messages','Continue private conversations','✉'],
+    ['messages','Chats','Continue private conversations','✉'],
     ['images','Media library','Browse your uploaded images','▧'],
     ['projects','Projects','Showcase things you are building','⌘'],
     ['movies','Movies','Keep track of what you watch','▣']
   ].map(([view,label,desc,icon]) => `<button type="button" class="home-shortcut" data-view="${view}"><span class="home-shortcut-icon">${icon}</span><span><strong>${label}</strong><small>${desc}</small></span><span class="home-shortcut-arrow">›</span></button>`).join('');
-  viewContainer.innerHTML = pageHead('Home', `Welcome back, ${currentProfile.display_name}.`, '<button class="button primary" data-action="new-post">Write a post</button>') +
-    `<div class="home-intro"><div><strong>@${esc(currentProfile.username)}</strong><p>${esc(currentProfile.bio || 'Your personal corner of the internet.')}</p></div><button type="button" class="button subtle" data-view="profile">View profile</button></div>` +
-    section('Quick access', `<div class="home-shortcuts">${shortcuts}</div>`) +
-    section('Activity feed', `<p class="muted home-feed-note">Recent posts shared with you appear here.</p>${cards}`);
+  const composer = `<form id="post-form" class="content-form home-post-form"><label>Post<textarea name="body" maxlength="10000" placeholder="What’s on your mind?"></textarea></label><label>Add images<input name="images" type="file" accept="image/jpeg,image/png,image/webp,image/gif" multiple></label><small class="muted">Choose up to 5 images. Each image can be up to 10 MB. You can publish an image without text.</small><div id="post-image-preview" class="post-image-preview"></div><label>Who can see this?<select name="visibility"><option value="public">Public</option><option value="friends">Friends only</option><option value="private">Private</option></select></label><div class="inline-actions"><button class="button primary" type="submit">Publish post</button><button class="button" type="button" data-action="close-home-compose">Cancel</button></div></form>`;
+  viewContainer.classList.add('home-view');
+  viewContainer.innerHTML = pageHead('Home', `Welcome back, ${currentProfile.display_name}.`, '<button class="button primary" id="home-compose-toggle" data-action="new-post" type="button">＋ Write a post</button>') +
+    `<div id="home-compose" class="home-compose" hidden>${composer}</div>` +
+    `<details class="home-quick-access home-collapsible"><summary>Quick access <span class="muted">6 shortcuts</span></summary><div class="home-shortcuts">${shortcuts}</div></details>` +
+    `<section class="section home-feed-panel"><details class="home-feed-details" open><summary class="section-title">Activity feed <span class="muted">Latest 8 posts</span></summary><div class="home-feed-content">${cards}</div></details></section>`;
 }
 async function renderProfile() {
   const p = currentProfile;
@@ -530,7 +538,7 @@ async function renderFriends() {
     `<section class="connection-section" data-friend-section="following" hidden><h3 class="section-title">Following</h3>${followingHtml}</section>` +
     `<section class="connection-section" data-friend-section="requests" hidden><h3 class="section-title">Incoming requests</h3>${incomingHtml}<h3 class="section-title request-subtitle">Sent requests</h3>${sentHtml}</section>`;
 }
-async function renderMessages() {
+async function renderChats() {
   const keepChat = activeChatUser;
   const { data: friends, error } = await supabase.from('friendships').select('requester_id,addressee_id,status').eq('status', 'accepted').or(`requester_id.eq.${currentUser.id},addressee_id.eq.${currentUser.id}`);
   if (error) throw error;
@@ -565,7 +573,7 @@ async function renderMessages() {
   }).join('') : empty('You need an accepted friend connection before messaging.');
   viewContainer.classList.add('messages-view');
   viewContainer.innerHTML =
-    `<div class="message-layout friends-message-layout"><aside class="conversation-list"><strong>Your friends</strong><label class="message-search-label"><span class="sr-only">Search friends</span><input id="message-friend-search" type="search" placeholder="Search friends…" autocomplete="off"></label><div id="message-friend-list">${list}</div><p id="message-no-results" class="muted" hidden>No matching friends.</p></aside><section class="chat-panel"><div class="chat-peer-header" id="chat-peer-header">${empty('Select a friend to start chatting.')}</div><div class="chat-messages" id="chat-messages">${empty('Your conversation will appear here.')}</div><div id="message-image-preview" class="message-image-preview" hidden></div><form id="message-form" class="chat-compose"><label class="message-attach" title="Attach an image" aria-label="Attach an image">＋<input name="image" type="file" accept="image/jpeg,image/png,image/webp,image/gif" hidden disabled></label><div class="emoji-picker-wrap"><button type="button" class="emoji-toggle" data-toggle-emoji disabled aria-label="Choose emoji" title="Choose emoji">☺</button><div class="emoji-picker" id="message-emoji-picker" hidden>${["😀","😂","🥰","😍","😉","😊","😎","😭","😢","😡","👍","👎","👏","🙏","❤️","🔥","🎉","💯","🤔","🙌","😘","🤣","😅","💔","✨","🌹","☀️","💪"].map(emoji => `<button type="button" data-insert-emoji="${emoji}">${emoji}</button>`).join('')}</div></div><input name="body" placeholder="Write a message…" aria-label="Message" maxlength="5000" disabled><button class="button primary" type="submit" disabled>Send</button></form></section></div>`;
+    `<div class="message-layout friends-message-layout"><aside class="conversation-list"><strong>Your friends</strong><label class="message-search-label"><span class="sr-only">Search friends</span><input id="message-friend-search" type="search" placeholder="Search friends…" autocomplete="off"></label><div id="message-friend-list">${list}</div><p id="message-no-results" class="muted" hidden>No matching friends.</p></aside><section class="chat-panel"><div class="chat-peer-header" id="chat-peer-header">${empty('Select a friend to start chatting.')}</div><div class="chat-messages" id="chat-messages">${empty('Your conversation will appear here.')}</div><div id="message-image-preview" class="message-image-preview" hidden></div><form id="message-form" class="chat-compose"><label class="message-attach" title="Attach an image" aria-label="Attach an image">＋<input name="image" type="file" accept="image/jpeg,image/png,image/webp,image/gif" hidden disabled></label><div class="emoji-picker-wrap"><button type="button" class="emoji-toggle" data-toggle-emoji disabled aria-label="Choose emoji" title="Choose emoji">☺</button><div class="emoji-picker" id="message-emoji-picker" hidden>${["😀","😂","🥰","😍","😉","😊","😎","😭","😢","😡","👍","👎","👏","🙏","❤️","🔥","🎉","💯","🤔","🙌","😘","🤣","😅","💔","✨","🌹","☀️","💪"].map(emoji => `<button type="button" data-insert-emoji="${emoji}">${emoji}</button>`).join('')}</div></div><textarea name="body" rows="2" placeholder="Write a message…" aria-label="Message" maxlength="5000" enterkeyhint="enter" disabled></textarea><button class="button primary" type="submit" disabled>Send</button></form></section></div>`;
   const selected = people.find(p => p.id === keepChat);
   activeChatUser = null;
   if (selected) await openChat(selected.id);
@@ -578,14 +586,14 @@ async function openChat(userId) {
     const oldPreview = $('#message-image-preview'); if (oldPreview) { oldPreview.hidden = true; oldPreview.innerHTML = ''; }
   }
   activeChatUser = userId;
-  const chatUrl = 'messages.html?chat=' + encodeURIComponent(userId);
-  if (location.pathname.split('/').pop() === 'messages.html' && location.search !== '?chat=' + encodeURIComponent(userId)) history.replaceState({ view:'messages', chat:userId }, '', chatUrl);
+  const chatUrl = 'chats.html?chat=' + encodeURIComponent(userId);
+  if (location.pathname.split('/').pop() === 'chats.html' && location.search !== '?chat=' + encodeURIComponent(userId)) history.replaceState({ view:'messages', chat:userId }, '', chatUrl);
   viewContainer.classList.add('messages-view', 'has-active-chat');
   const box = $('#chat-messages');
   const form = $('#message-form');
   if (!box || !form) return;
   $$('.friend-chat-item').forEach(button => button.classList.toggle('active', button.dataset.chatUser === userId));
-  form.querySelector('input[name=body]').disabled = false;
+  form.querySelector('textarea[name=body]').disabled = false;
   form.querySelector('input[name=image]').disabled = false;
   form.querySelector('[data-toggle-emoji]').disabled = false;
   form.querySelector('button[type=submit]').disabled = false;
@@ -675,7 +683,7 @@ async function handleAuth(event, kind) {
       currentUser = result.data.user;
       await loadProfile();
       showApp();
-      go('home');
+      await renderView();
     } else {
       const displayName = String(fd.get('display_name') || '').trim();
       const username = String(fd.get('username') || '').trim().toLowerCase();
@@ -686,7 +694,7 @@ async function handleAuth(event, kind) {
         currentUser = result.data.user;
         await loadProfile();
         showApp();
-        go('home');
+        await renderView();
       } else {
         setAuthMessage('Account created. Check your email and confirm the address. Then return to this page and log in with the same email and password. If the confirmation link sends you somewhere unexpected, the Supabase redirect URL needs configuring.');
       }
@@ -809,7 +817,7 @@ async function submitPost(form) {
       if (saved.error) throw saved.error;
     }
     toast('Post published.');
-    await renderPosts();
+    if (currentView === 'home') await renderHome(); else await renderPosts();
   } catch (error) {
     if (uploaded.length) await supabase.storage.from('user-media').remove(uploaded);
     if (postId) await supabase.from('posts').delete().eq('id', postId).eq('user_id', currentUser.id);
@@ -961,10 +969,25 @@ document.addEventListener('click', async event => {
   if (event.target.closest('#logout-button')) { stopRealtime(); await supabase.auth.signOut(); currentUser = null; currentProfile = null; showAuth(); return; }
   if (event.target.closest('[data-action="retry"]')) { renderView(); return; }
   if (event.target.closest('[data-load-new-posts]')) { await renderHome(); window.scrollTo({ top: 0, behavior: 'smooth' }); return; }
-  if (event.target.closest('[data-chat-back]')) { viewContainer.classList.remove('has-active-chat'); activeChatUser = null; history.replaceState({ view:'messages' }, '', 'messages.html'); return; }
+  if (event.target.closest('[data-chat-back]')) { viewContainer.classList.remove('has-active-chat'); activeChatUser = null; history.replaceState({ view:'messages' }, '', 'chats.html'); return; }
   if (event.target.closest('[data-toggle-emoji]')) { const picker = $('#message-emoji-picker'); if (picker) picker.hidden = !picker.hidden; return; }
-  const insertEmoji = event.target.closest('[data-insert-emoji]'); if (insertEmoji) { const input = $('#message-form input[name=body]'); if (input && !input.disabled) { const start = input.selectionStart ?? input.value.length; const end = input.selectionEnd ?? input.value.length; input.value = input.value.slice(0,start) + insertEmoji.dataset.insertEmoji + input.value.slice(end); input.focus(); const pos = start + insertEmoji.dataset.insertEmoji.length; input.setSelectionRange(pos,pos); } const picker = $('#message-emoji-picker'); if (picker) picker.hidden = true; return; }
-  if (event.target.closest('[data-action="focus-post"]') || event.target.closest('[data-action="new-post"]')) { if (currentView !== 'posts') go('posts'); else $('#post-form textarea')?.focus(); return; }
+  const insertEmoji = event.target.closest('[data-insert-emoji]'); if (insertEmoji) { const input = $('#message-form textarea[name=body]'); if (input && !input.disabled) { const start = input.selectionStart ?? input.value.length; const end = input.selectionEnd ?? input.value.length; input.value = input.value.slice(0,start) + insertEmoji.dataset.insertEmoji + input.value.slice(end); input.focus(); const pos = start + insertEmoji.dataset.insertEmoji.length; input.setSelectionRange(pos,pos); } const picker = $('#message-emoji-picker'); if (picker) picker.hidden = true; return; }
+  const newPostAction = event.target.closest('[data-action="new-post"]');
+  if (newPostAction) {
+    if (currentView === 'home') {
+      const composer = $('#home-compose');
+      if (composer) {
+        composer.hidden = !composer.hidden;
+        const toggle = $('#home-compose-toggle');
+        if (toggle) toggle.textContent = composer.hidden ? '＋ Write a post' : 'Close composer';
+        if (!composer.hidden) $('#post-form textarea')?.focus();
+      }
+    } else if (currentView !== 'posts') go('posts');
+    else $('#post-form textarea')?.focus();
+    return;
+  }
+  if (event.target.closest('[data-action="focus-post"]')) { if (currentView !== 'posts') go('posts'); else $('#post-form textarea')?.focus(); return; }
+  if (event.target.closest('[data-action="close-home-compose"]')) { const composer = $('#home-compose'); if (composer) composer.hidden = true; const toggle = $('#home-compose-toggle'); if (toggle) toggle.textContent = '＋ Write a post'; return; }
   const delPost = event.target.closest('[data-delete-post]'); if (delPost) { if (!confirm('Delete this post?')) return; const postId = delPost.dataset.deletePost; const media = await supabase.from('post_media').select('storage_path').eq('post_id', postId); if (media.error) return toast(media.error.message); const paths = (media.data || []).map(x => x.storage_path); const removed = await supabase.from('posts').delete().eq('id', postId).eq('user_id', currentUser.id); if (removed.error) return toast(removed.error.message); if (paths.length) await supabase.storage.from('user-media').remove(paths); toast('Post deleted.'); renderView(); return; }
   const imageButton = event.target.closest('[data-post-image]'); if (imageButton) { openPostImage(imageButton); return; }
   const chatImage = event.target.closest('[data-chat-image]'); if (chatImage) { openImageViewer([chatImage.dataset.chatImage]); return; }
@@ -1004,6 +1027,16 @@ document.addEventListener('change', event => {
   else if (input.matches('#cover-upload-form input[type=file]')) openProfileCropper(input, 'cover_url');
 });
 
+document.addEventListener('keydown', event => {
+  const composer = event.target.closest('#message-form textarea[name="body"]');
+  if (!composer) return;
+  if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
+    event.preventDefault();
+    composer.form?.requestSubmit();
+  }
+  // Plain Enter is intentionally left to the textarea so it inserts a new line.
+});
+
 document.addEventListener('submit', async event => {
   const form = event.target;
   if (form.id === 'login-form') return handleAuth(event, 'login');
@@ -1037,12 +1070,18 @@ if (!isConfigured) {
 } else {
   supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, { auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true } });
   supabase.auth.onAuthStateChange((_event, session) => {
+    const previousUserId = currentUser?.id || null;
     currentUser = session?.user || null;
-    if (!currentUser) { stopRealtime(); currentProfile = null; showAuth(); return; }
-    startRealtime(currentUser.id);
+    if (!currentUser) {
+      if (previousUserId) stopRealtime();
+      currentProfile = null;
+      showAuth();
+      return;
+    }
     showApp();
-    // Avoid awaiting Supabase calls inside its auth callback.
-    Promise.resolve().then(() => { if (currentUser?.id === session.user.id) go('home'); });
+    // Do not redirect here. The page selected by the URL must survive session restoration.
+    // Login/registration handlers and the initial getSession() path render the current page.
+    if (previousUserId !== currentUser.id) startRealtime(currentUser.id);
   });
   const { data, error } = await supabase.auth.getSession();
   if (error) setAuthMessage(error.message, true);
