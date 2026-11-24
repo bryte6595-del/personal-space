@@ -1,5 +1,6 @@
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
 import { SUPABASE_URL, SUPABASE_ANON_KEY, isConfigured } from './config.js';
+import { pageRoutes, viewFromLocation } from './modules/routes.js';
 
 const $ = (s, root = document) => root.querySelector(s);
 const $$ = (s, root = document) => [...root.querySelectorAll(s)];
@@ -12,10 +13,10 @@ function safeHttpUrl(value) { try { const url = new URL(String(value), location.
 let supabase;
 let currentUser = null;
 let currentProfile = null;
-let currentView = 'home';
-let activeChatUser = null;
+let currentView = viewFromLocation(titles);
+let activeChatUser = new URLSearchParams(location.search).get('chat');
 let chatProfiles = {};
-let viewedProfileId = null;
+let viewedProfileId = new URLSearchParams(location.search).get('member');
 let renderToken = 0;
 let realtimeChannel = null;
 let presenceChannel = null;
@@ -71,11 +72,25 @@ function profileLink(person, label = '') {
   return `<button type="button" class="profile-link" data-open-profile="${esc(person?.id || '')}" aria-label="View ${esc(name)} profile"><span class="avatar mini">${avatar}</span><span class="profile-link-text"><strong>${esc(name)}</strong><small>@${esc(username)}${label ? ` · ${esc(label)}` : ''}</small></span></button>`;
 }
 function field(label, name, value = '', type = 'text', extra = '') { return `<label>${esc(label)}<input name="${esc(name)}" type="${type}" value="${esc(value)}" ${extra}></label>`; }
-async function go(view) {
+async function go(view, options = {}) {
   const nextView = view in titles ? view : 'home';
-  if (nextView === 'messages' && currentView !== 'messages') activeChatUser = null;
+  const route = pageRoutes[nextView] || 'index.html';
+  const params = new URLSearchParams();
+  if (nextView === 'public-profile' && viewedProfileId) params.set('member', viewedProfileId);
+  if (nextView === 'messages' && options.chat) params.set('chat', options.chat);
+  if (['images','videos','audio'].includes(nextView)) params.set('type', nextView);
+  const query = params.toString();
+  const target = route + (query ? '?' + query : '');
+  const currentPath = location.pathname.split('/').pop() || 'index.html';
+  const currentQuery = location.search.replace(/^\?/, '');
+  if (currentPath !== route || currentQuery !== query) {
+    window.location.assign(target);
+    return;
+  }
+  if (nextView === 'messages' && currentView !== 'messages' && !options.chat) activeChatUser = null;
   currentView = nextView;
-  if (location.hash !== '#' + currentView) history.pushState({ view: currentView }, '', '#' + currentView);
+  if (nextView === 'messages' && options.chat) activeChatUser = options.chat;
+  if (nextView === 'public-profile') viewedProfileId = params.get('member');
   $$('.nav-link').forEach(a => a.classList.toggle('active', a.dataset.view === currentView));
   $('#breadcrumb').textContent = titles[currentView];
   closeMobileSidebar();
@@ -267,6 +282,7 @@ async function loadProfile() {
   updateIdentity();
 }
 async function renderView() {
+  document.title = `${titles[currentView] || 'Home'} | Personal Space`;
   if (!currentUser) return showAuth();
   const token = ++renderToken;
   viewContainer.classList.remove('messages-view', 'has-active-chat');
@@ -562,6 +578,8 @@ async function openChat(userId) {
     const oldPreview = $('#message-image-preview'); if (oldPreview) { oldPreview.hidden = true; oldPreview.innerHTML = ''; }
   }
   activeChatUser = userId;
+  const chatUrl = 'messages.html?chat=' + encodeURIComponent(userId);
+  if (location.pathname.split('/').pop() === 'messages.html' && location.search !== '?chat=' + encodeURIComponent(userId)) history.replaceState({ view:'messages', chat:userId }, '', chatUrl);
   viewContainer.classList.add('messages-view', 'has-active-chat');
   const box = $('#chat-messages');
   const form = $('#message-form');
@@ -906,9 +924,10 @@ function toggleMobileSidebar() {
 
 // Keep section navigation compatible with the browser's Back and Forward buttons.
 window.addEventListener('popstate', () => {
-  const requested = location.hash.slice(1) || 'home';
-  currentView = requested in titles ? requested : 'home';
-  if (currentView === 'messages') activeChatUser = null;
+  currentView = viewFromLocation(titles);
+  const params = new URLSearchParams(location.search);
+  viewedProfileId = params.get('member');
+  activeChatUser = params.get('chat');
   $$('.nav-link').forEach(a => a.classList.toggle('active', a.dataset.view === currentView));
   $('#breadcrumb').textContent = titles[currentView];
   closeMobileSidebar();
@@ -927,7 +946,7 @@ document.addEventListener('click', async event => {
   }
   if (event.target.closest('#notification-close')) { notificationPanelOpen = false; $('#notification-panel').hidden = true; $('#notification-button').setAttribute('aria-expanded','false'); return; }
   const notificationChat = event.target.closest('[data-notification-chat]');
-  if (notificationChat) { $('#notification-panel').hidden = true; notificationPanelOpen = false; await go('messages'); await openChat(notificationChat.dataset.notificationChat); return; }
+  if (notificationChat) { $('#notification-panel').hidden = true; notificationPanelOpen = false; go('messages', { chat: notificationChat.dataset.notificationChat }); return; }
   if (event.target.closest('[data-notification-friends]')) { $('#notification-panel').hidden = true; notificationPanelOpen = false; go('friends'); return; }
   const notificationPost = event.target.closest('[data-notification-post]');
   if (notificationPost) { setPostSeenAt(notificationPost.dataset.postCreated || new Date().toISOString()); $('#notification-panel').hidden = true; notificationPanelOpen = false; viewedProfileId = notificationPost.dataset.notificationPost; go('public-profile'); return; }
@@ -942,7 +961,7 @@ document.addEventListener('click', async event => {
   if (event.target.closest('#logout-button')) { stopRealtime(); await supabase.auth.signOut(); currentUser = null; currentProfile = null; showAuth(); return; }
   if (event.target.closest('[data-action="retry"]')) { renderView(); return; }
   if (event.target.closest('[data-load-new-posts]')) { await renderHome(); window.scrollTo({ top: 0, behavior: 'smooth' }); return; }
-  if (event.target.closest('[data-chat-back]')) { viewContainer.classList.remove('has-active-chat'); return; }
+  if (event.target.closest('[data-chat-back]')) { viewContainer.classList.remove('has-active-chat'); activeChatUser = null; history.replaceState({ view:'messages' }, '', 'messages.html'); return; }
   if (event.target.closest('[data-toggle-emoji]')) { const picker = $('#message-emoji-picker'); if (picker) picker.hidden = !picker.hidden; return; }
   const insertEmoji = event.target.closest('[data-insert-emoji]'); if (insertEmoji) { const input = $('#message-form input[name=body]'); if (input && !input.disabled) { const start = input.selectionStart ?? input.value.length; const end = input.selectionEnd ?? input.value.length; input.value = input.value.slice(0,start) + insertEmoji.dataset.insertEmoji + input.value.slice(end); input.focus(); const pos = start + insertEmoji.dataset.insertEmoji.length; input.setSelectionRange(pos,pos); } const picker = $('#message-emoji-picker'); if (picker) picker.hidden = true; return; }
   if (event.target.closest('[data-action="focus-post"]') || event.target.closest('[data-action="new-post"]')) { if (currentView !== 'posts') go('posts'); else $('#post-form textarea')?.focus(); return; }
@@ -960,7 +979,7 @@ document.addEventListener('click', async event => {
   const add = event.target.closest('[data-add-friend]'); if (add) { await sendFriendRequest(add.dataset.addFriend); return; }
   const accept = event.target.closest('[data-accept-friend]'); if (accept) { await acceptFriend(accept.dataset.acceptFriend); return; }
   const follow = event.target.closest('[data-toggle-follow]'); if (follow) { const targetId = follow.dataset.toggleFollow; follow.disabled = true; const existing = await supabase.from('follows').select('follower_id').eq('follower_id', currentUser.id).eq('followed_id', targetId).maybeSingle(); if (existing.error) { follow.disabled = false; return toast(existing.error.message); } const result = existing.data ? await supabase.from('follows').delete().eq('follower_id', currentUser.id).eq('followed_id', targetId) : await supabase.from('follows').insert({ follower_id: currentUser.id, followed_id: targetId }); if (result.error) { follow.disabled = false; return toast(result.error.message); } follow.textContent = existing.data ? 'Follow' : 'Unfollow'; follow.disabled = false; toast(existing.data ? 'You unfollowed this person.' : 'You are now following this person.'); return; }
-  const messageUser = event.target.closest('[data-message-user]'); if (messageUser) { const targetId = messageUser.dataset.messageUser; await go('messages'); await openChat(targetId); return; }
+  const messageUser = event.target.closest('[data-message-user]'); if (messageUser) { const targetId = messageUser.dataset.messageUser; go('messages', { chat: targetId }); return; }
   const friendTab = event.target.closest('[data-friend-tab]'); if (friendTab) { $$('[data-friend-tab]').forEach(b => b.classList.toggle('active', b === friendTab)); $$('[data-friend-section]').forEach(panel => { panel.hidden = panel.dataset.friendSection !== friendTab.dataset.friendTab; }); return; }
   const decline = event.target.closest('[data-decline-friend], [data-cancel-friend]'); if (decline) { const id = decline.dataset.declineFriend || decline.dataset.cancelFriend; if (!confirm(decline.hasAttribute('data-decline-friend') ? 'Decline this friend request?' : 'Cancel this sent request?')) return; const { error } = await supabase.from('friendships').delete().eq('id', id); toast(error ? error.message : 'Request removed.'); if (!error) renderView(); return; }
   const chat = event.target.closest('[data-chat-user]'); if (chat) { await openChat(chat.dataset.chatUser); return; }
@@ -1023,7 +1042,7 @@ if (!isConfigured) {
     startRealtime(currentUser.id);
     showApp();
     // Avoid awaiting Supabase calls inside its auth callback.
-    Promise.resolve().then(() => { if (currentUser?.id === session.user.id) go(location.hash.slice(1) || 'home'); });
+    Promise.resolve().then(() => { if (currentUser?.id === session.user.id) go('home'); });
   });
   const { data, error } = await supabase.auth.getSession();
   if (error) setAuthMessage(error.message, true);
