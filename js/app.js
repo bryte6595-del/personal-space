@@ -9,7 +9,7 @@ const app = $('#app');
 const viewContainer = $('#view-container');
 const titles = { home:'Home', profile:'My profile', 'public-profile':'Member profile', posts:'Posts', friends:'Friends & followers', messages:'Chats', images:'Images', videos:'Videos', audio:'Audio', projects:'Projects & games', movies:'Movies', recommendations:'Recommendations', settings:'Settings' };
 const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-function safeHttpUrl(value) { try { const url = new URL(String(value), location.origin); return ['http:', 'https:'].includes(url.protocol) ? url.href : ''; } catch { return ''; } }
+function safeHttpUrl(value) { if (value == null || String(value).trim() === '') return ''; try { const url = new URL(String(value).trim()); return ['http:', 'https:'].includes(url.protocol) ? url.href : ''; } catch { return ''; } }
 let supabase;
 let currentUser = null;
 let currentProfile = null;
@@ -97,6 +97,17 @@ async function go(view, options = {}) {
   closeMobileSidebar();
   await renderView();
 }
+const PAGE_SIZE = 10;
+let feedContext = null;
+function loadMoreMarkup(count) { return count >= PAGE_SIZE ? '<div class="load-more-wrap"><button class="button" type="button" data-load-more-posts>Load more posts</button></div>' : ''; }
+function entryBody(item) {
+  const url = safeHttpUrl(item.url), gh = safeHttpUrl(item.github_url);
+  const meta = [item.status, item.category, item.release_year, item.watched_on ? `Watched ${item.watched_on}` : '', item.rating != null ? `Rating ${item.rating}/10` : ''].filter(x => x !== '' && x != null).map(esc).join(' · ');
+  const links = [url ? `<a href="${esc(url)}" target="_blank" rel="noopener noreferrer">Open link</a>` : '', gh ? `<a href="${esc(gh)}" target="_blank" rel="noopener noreferrer">GitHub</a>` : ''].filter(Boolean).join(' · ');
+  const text = item.description || item.review || '';
+  return `<strong>${esc(item.title)}</strong>${text ? `<p>${esc(text)}</p>` : ''}${meta ? `<span class="post-meta">${meta}</span>` : ''}${links ? `<p>${links}</p>` : ''}${item.affiliate_disclosure ? `<p class="muted"><small>Disclosure: ${esc(item.affiliate_disclosure)}</small></p>` : ''}`;
+}
+function blockedMessage(error, fallbackText) { return /row-level security|violates/i.test(error?.message || '') ? fallbackText : errorText(error); }
 function errorText(error) { return error?.message || 'Something went wrong. Please try again.'; }
 function stopRealtime() {
   if (realtimeRefreshTimer) window.clearTimeout(realtimeRefreshTimer);
@@ -356,7 +367,7 @@ async function buildPostCards(posts, { allowDelete = false } = {}) {
     const like = likesByPost[post.id] || { count: 0, mine: false };
     const comments = commentsByPost[post.id] || [];
     const roots = comments.filter(c => !c.parent_comment_id);
-    return `<article class="post-card" data-post-card="${post.id}"><div class="post-card-head">${profileLink(author)}<div class="post-head-meta"><span class="post-meta">${new Date(post.created_at).toLocaleString()}</span><span class="post-visibility">${esc(post.visibility)}</span></div>${allowDelete && post.user_id === currentUser.id ? `<button type="button" class="text-button" data-delete-post="${post.id}">Delete</button>` : ''}</div>${post.body ? `<p class="post-body">${esc(post.body)}</p>` : ''}${gallery}<div class="post-engagement"><button type="button" class="text-button like-button${like.mine ? ' liked' : ''}" data-toggle-like="${post.id}" aria-pressed="${like.mine}">${like.mine ? '♥ Liked' : '♡ Like'}</button><button type="button" class="text-button likes-count" data-show-likes="${post.id}" data-like-count="${like.count}" ${like.count ? '' : 'disabled'}>${like.count} ${like.count === 1 ? 'like' : 'likes'}</button><span class="post-meta">${comments.length} ${comments.length === 1 ? 'comment' : 'comments'}</span></div><div class="post-likers" data-likers="${post.id}" hidden>${(likersByPost[post.id] || []).map(person => profileLink(person)).join('')}</div><div class="post-comments">${roots.map(c => commentMarkup(c, comments)).join('')}<form class="comment-form" data-comment-form="${post.id}"><input name="body" maxlength="2000" placeholder="Write a comment…" required><button class="button" type="submit">Comment</button></form></div></article>`;
+    return `<article class="post-card" data-post-card="${post.id}"><div class="post-card-head">${profileLink(author)}<div class="post-head-meta"><span class="post-meta">${new Date(post.created_at).toLocaleString()}</span><span class="post-visibility">${esc(post.visibility)}</span></div>${allowDelete && post.user_id === currentUser.id ? `<button type="button" class="text-button" data-delete-post="${post.id}">Delete</button>` : ''}${post.user_id !== currentUser.id ? `<button type="button" class="text-button report-link" data-report-user="${post.user_id}" data-report-post="${post.id}">Report</button>` : ''}</div>${post.body ? `<p class="post-body">${esc(post.body)}</p>` : ''}${gallery}<div class="post-engagement"><button type="button" class="text-button like-button${like.mine ? ' liked' : ''}" data-toggle-like="${post.id}" aria-pressed="${like.mine}">${like.mine ? '♥ Liked' : '♡ Like'}</button><button type="button" class="text-button likes-count" data-show-likes="${post.id}" data-like-count="${like.count}" ${like.count ? '' : 'disabled'}>${like.count} ${like.count === 1 ? 'like' : 'likes'}</button><span class="post-meta">${comments.length} ${comments.length === 1 ? 'comment' : 'comments'}</span></div><div class="post-likers" data-likers="${post.id}" hidden>${(likersByPost[post.id] || []).map(person => profileLink(person)).join('')}</div><div class="post-comments">${roots.map(c => commentMarkup(c, comments)).join('')}<form class="comment-form" data-comment-form="${post.id}"><input name="body" maxlength="2000" placeholder="Write a comment…" required><button class="button" type="submit">Comment</button></form></div></article>`;
   }).join('')}</div>`;
 }
 function openPostImage(button) {
@@ -453,9 +464,10 @@ async function renderHome() {
   if (friendRows.error) throw friendRows.error;
   if (followRows.error) throw followRows.error;
   const feedIds = [...new Set([currentUser.id, ...(friendRows.data || []).map(f => f.requester_id === currentUser.id ? f.addressee_id : f.requester_id), ...(followRows.data || []).map(f => f.followed_id)])];
-  const { data: posts, error } = await supabase.from('posts').select('id,user_id,body,visibility,created_at').in('user_id', feedIds).order('created_at', { ascending: false }).limit(8);
+  const { data: posts, error } = await supabase.from('posts').select('id,user_id,body,visibility,created_at').in('user_id', feedIds).order('created_at', { ascending: false }).range(0, PAGE_SIZE - 1);
   if (error) throw error;
-  const cards = await buildPostCards(posts || []);
+  feedContext = { kind: 'home', ids: feedIds, offset: (posts || []).length };
+  const cards = (await buildPostCards(posts || [])) + loadMoreMarkup((posts || []).length);
   const shortcuts = [
     ['profile','My profile','Edit your details and profile images','◉'],
     ['friends','Friends','Manage connections and requests','♧'],
@@ -469,7 +481,7 @@ async function renderHome() {
   viewContainer.innerHTML = pageHead('Home', `Welcome back, ${currentProfile.display_name}.`, '<button class="button primary" id="home-compose-toggle" data-action="new-post" type="button">＋ Write a post</button>') +
     `<div id="home-compose" class="home-compose" hidden>${composer}</div>` +
     `<details class="home-quick-access home-collapsible"><summary>Quick access <span class="muted">6 shortcuts</span></summary><div class="home-shortcuts">${shortcuts}</div></details>` +
-    `<section class="section home-feed-panel"><details class="home-feed-details" open><summary class="section-title">Activity feed <span class="muted">Latest 8 from you, friends and people you follow</span></summary><div class="home-feed-content">${cards}</div></details></section>`;
+    `<section class="section home-feed-panel"><details class="home-feed-details" open><summary class="section-title">Activity feed <span class="muted">Latest from you, friends and people you follow</span></summary><div class="home-feed-content">${cards}</div></details></section>`;
 }
 async function renderProfile() {
   const p = currentProfile;
@@ -490,10 +502,14 @@ async function renderPublicProfile() {
     viewContainer.innerHTML = pageHead('Profile unavailable', 'This profile may be private or no longer available.') + '<button class="button" data-view="friends">Back to people</button>';
     return;
   }
-  const [{ data: posts, error: postError }, { data: friendship }, { data: following }] = await Promise.all([
+  const [{ data: posts, error: postError }, { data: friendship }, { data: following }, { data: iBlocked }, projectsRes, moviesRes, recsRes] = await Promise.all([
     supabase.from('posts').select('id,user_id,body,visibility,created_at').eq('user_id', person.id).order('created_at', { ascending: false }).limit(50),
     supabase.from('friendships').select('id,status,requester_id,addressee_id').or(`and(requester_id.eq.${currentUser.id},addressee_id.eq.${person.id}),and(requester_id.eq.${person.id},addressee_id.eq.${currentUser.id})`).maybeSingle(),
-    supabase.from('follows').select('follower_id').eq('follower_id', currentUser.id).eq('followed_id', person.id).maybeSingle()
+    supabase.from('follows').select('follower_id').eq('follower_id', currentUser.id).eq('followed_id', person.id).maybeSingle(),
+    supabase.from('blocks').select('blocked_id').eq('blocker_id', currentUser.id).eq('blocked_id', person.id).maybeSingle(),
+    supabase.from('projects').select('*').eq('user_id', person.id).eq('visibility', 'public').order('created_at', { ascending: false }).limit(30),
+    supabase.from('movies').select('*').eq('user_id', person.id).eq('visibility', 'public').order('created_at', { ascending: false }).limit(30),
+    supabase.from('recommendations').select('*').eq('user_id', person.id).eq('visibility', 'public').order('created_at', { ascending: false }).limit(30)
   ]);
   if (postError) throw postError;
   const avatarUrl = safeHttpUrl(person.avatar_url);
@@ -504,34 +520,42 @@ async function renderPublicProfile() {
   const followAction = following ? `<button class="button" data-toggle-follow="${person.id}">Unfollow</button>` : `<button class="button" data-toggle-follow="${person.id}">Follow</button>`;
   const websiteUrl = safeHttpUrl(person.website);
   const website = websiteUrl ? `<p><a href="${esc(websiteUrl)}" target="_blank" rel="noopener noreferrer">${esc(person.website)}</a></p>` : '';
-  const postRows = await buildPostCards(posts || []);
+  const postRows = iBlocked ? '' : await buildPostCards(posts || []);
+  const showcase = (title, result) => (!iBlocked && result?.data?.length) ? section(title, `<ul class="plain-list">${result.data.map(item => `<li>${entryBody(item)}</li>`).join('')}</ul>`) : '';
+  const actions = iBlocked
+    ? `<span class="muted">You blocked this person.</span><button class="button" type="button" data-unblock-user="${person.id}">Unblock</button>`
+    : `${friendshipAction}${followAction}<button class="button subtle" type="button" data-report-user="${person.id}">Report</button><button class="button subtle danger" type="button" data-block-user="${person.id}">Block</button>`;
   const joined = person.created_at ? `Member since ${new Date(person.created_at).toLocaleDateString()}` : '';
   viewContainer.innerHTML = pageHead('Member profile', `A look at what ${person.display_name} has chosen to share.`, '<button class="button" data-view="friends">Back to people</button>') + cover +
-    `<div class="profile-header"><div class="avatar">${avatar}</div><div><h2>${esc(person.display_name)}</h2><p class="muted">@${esc(person.username)}</p><p>${esc(person.bio || 'No biography added.')}</p>${website}<p class="post-meta">${esc(joined)}</p><div class="inline-actions">${friendshipAction}${followAction}</div></div></div>` +
-    section('Publications', postRows);
+    `<div class="profile-header"><div class="avatar">${avatar}</div><div><h2>${esc(person.display_name)}</h2><p class="muted">@${esc(person.username)}</p><p>${esc(person.bio || 'No biography added.')}</p>${website}<p class="post-meta">${esc(joined)}</p><div class="inline-actions">${actions}</div></div></div>` +
+    (iBlocked ? '' : section('Publications', postRows)) + showcase('Projects & games', projectsRes) + showcase('Movies', moviesRes) + showcase('Recommendations', recsRes);
 }
 
 async function renderPosts() {
-  const { data: posts, error } = await supabase.from('posts').select('id,user_id,body,visibility,created_at').eq('user_id', currentUser.id).order('created_at', { ascending: false });
+  const { data: posts, error } = await supabase.from('posts').select('id,user_id,body,visibility,created_at').eq('user_id', currentUser.id).order('created_at', { ascending: false }).range(0, PAGE_SIZE - 1);
   if (error) throw error;
-  const cards = await buildPostCards(posts || [], { allowDelete: true });
+  feedContext = { kind: 'mine', ids: [currentUser.id], offset: (posts || []).length };
+  const cards = (await buildPostCards(posts || [], { allowDelete: true })) + loadMoreMarkup((posts || []).length);
   viewContainer.innerHTML = pageHead('My posts', 'Share words, photographs or both.', '<button class="button primary" data-action="focus-post">New post</button>') +
     `<form id="post-form" class="content-form"><h3>Write something</h3><label>Post<textarea name="body" maxlength="10000" placeholder="What’s on your mind?"></textarea></label><label>Add images<input name="images" type="file" accept="image/jpeg,image/png,image/webp,image/gif" multiple></label><small class="muted">Choose up to 5 images. Each image can be up to 10 MB. You can publish an image without text.</small><div id="post-image-preview" class="post-image-preview"></div><label>Who can see this?<select name="visibility"><option value="public">Public</option><option value="friends">Friends only</option><option value="private">Private</option></select></label><button class="button primary" type="submit">Publish post</button></form>` +
     section('Published posts', cards);
 }
 async function renderFriends() {
-  const [{ data: links, error }, { data: follows, error: followError }] = await Promise.all([
+  const [{ data: links, error }, { data: follows, error: followError }, { data: blockRows, error: blockError }] = await Promise.all([
     supabase.from('friendships').select('*').or(`requester_id.eq.${currentUser.id},addressee_id.eq.${currentUser.id}`).order('created_at', { ascending: false }),
-    supabase.from('follows').select('*').or(`follower_id.eq.${currentUser.id},followed_id.eq.${currentUser.id}`)
+    supabase.from('follows').select('*').or(`follower_id.eq.${currentUser.id},followed_id.eq.${currentUser.id}`),
+    supabase.from('blocks').select('blocked_id').eq('blocker_id', currentUser.id)
   ]);
   if (error) throw error;
   if (followError) throw followError;
+  if (blockError) throw blockError;
+  const blocked = blockRows || [];
   const accepted = (links || []).filter(x => x.status === 'accepted');
   const incoming = (links || []).filter(x => x.status === 'pending' && x.addressee_id === currentUser.id);
   const sent = (links || []).filter(x => x.status === 'pending' && x.requester_id === currentUser.id);
   const followers = (follows || []).filter(x => x.followed_id === currentUser.id);
   const following = (follows || []).filter(x => x.follower_id === currentUser.id);
-  const otherIds = [...new Set([...(links || []).map(x => x.requester_id === currentUser.id ? x.addressee_id : x.requester_id), ...(follows || []).map(x => x.follower_id === currentUser.id ? x.followed_id : x.follower_id)])];
+  const otherIds = [...new Set([...(links || []).map(x => x.requester_id === currentUser.id ? x.addressee_id : x.requester_id), ...(follows || []).map(x => x.follower_id === currentUser.id ? x.followed_id : x.follower_id), ...blocked.map(x => x.blocked_id)])];
   let people = [];
   if (otherIds.length) { const r = await supabase.from('profiles').select('id,username,display_name,avatar_url').in('id', otherIds); if (r.error) throw r.error; people = r.data || []; }
   const byId = Object.fromEntries(people.map(p => [p.id, p]));
@@ -541,13 +565,15 @@ async function renderFriends() {
   const friendsHtml = personRows(accepted, x => x.requester_id === currentUser.id ? x.addressee_id : x.requester_id, id => `<button class="button subtle" data-chat-user="${id}">Message</button>`);
   const followersHtml = personRows(followers, x => x.follower_id, (x, id) => `<button class="button subtle" data-toggle-follow="${id}">${following.some(f => f.followed_id === id) ? 'Unfollow' : 'Follow back'}</button>`);
   const followingHtml = personRows(following, x => x.followed_id);
+  const blockedHtml = personRows(blocked, x => x.blocked_id, (x, id) => `<button class="button subtle" type="button" data-unblock-user="${id}">Unblock</button>`);
   viewContainer.innerHTML = pageHead('Friends & followers', 'Keep your connections and requests in separate places.') +
     `<form id="user-search" class="content-form connection-search"><h3>Find someone</h3><label>Search by exact username<input name="username" placeholder="Enter username" required></label><button class="button" type="submit">Search</button><div id="search-results"></div></form>` +
-    `<nav class="connection-tabs" aria-label="Connections sections">${[['friends','Friends',accepted.length],['followers','Followers',followers.length],['following','Following',following.length],['requests','Friend requests',incoming.length + sent.length]].map(([key,label,count]) => `<button type="button" class="connection-tab${key === 'friends' ? ' active' : ''}" data-friend-tab="${key}">${label}<span>${count}</span></button>`).join('')}</nav>` +
+    `<nav class="connection-tabs" aria-label="Connections sections">${[['friends','Friends',accepted.length],['followers','Followers',followers.length],['following','Following',following.length],['requests','Friend requests',incoming.length + sent.length],['blocked','Blocked',blocked.length]].map(([key,label,count]) => `<button type="button" class="connection-tab${key === 'friends' ? ' active' : ''}" data-friend-tab="${key}">${label}<span>${count}</span></button>`).join('')}</nav>` +
     `<section class="connection-section" data-friend-section="friends"><h3 class="section-title">Friends</h3>${friendsHtml}</section>` +
     `<section class="connection-section" data-friend-section="followers" hidden><h3 class="section-title">Followers</h3>${followersHtml}</section>` +
     `<section class="connection-section" data-friend-section="following" hidden><h3 class="section-title">Following</h3>${followingHtml}</section>` +
-    `<section class="connection-section" data-friend-section="requests" hidden><h3 class="section-title">Incoming requests</h3>${incomingHtml}<h3 class="section-title request-subtitle">Sent requests</h3>${sentHtml}</section>`;
+    `<section class="connection-section" data-friend-section="requests" hidden><h3 class="section-title">Incoming requests</h3>${incomingHtml}<h3 class="section-title request-subtitle">Sent requests</h3>${sentHtml}</section>` +
+    `<section class="connection-section" data-friend-section="blocked" hidden><h3 class="section-title">Blocked people</h3><p class="muted">Blocked people cannot see your profile or posts, or message you.</p>${blockedHtml}</section>`;
 }
 async function renderChats() {
   const keepChat = activeChatUser;
@@ -667,15 +693,15 @@ async function renderCollection(table) {
     const type = f === 'url' || f === 'github_url' ? 'url' : f === 'watched_on' ? 'date' : f === 'rating' || f === 'release_year' ? 'number' : 'text';
     const extra = f === 'title' ? 'required maxlength="160"' : f === 'rating' ? 'min="0" max="10" step="0.5"' : f === 'release_year' ? 'min="1880" max="2100"' : '';
     return `<label>${esc(label)}<input name="${f}" type="${type}" ${extra}></label>`;
-  }).join('');
-  const rows = data.length ? `<ul class="plain-list">${data.map(item => `<li><strong>${esc(item.title)}</strong><p>${esc(item.description || item.review || '')}</p><span class="post-meta">${esc(item.status || item.category || item.watched_on || '')}${item.rating != null ? ` · Rating ${esc(item.rating)}/10` : ''}</span>${safeHttpUrl(item.url) ? `<p><a href="${esc(safeHttpUrl(item.url))}" target="_blank" rel="noopener noreferrer">Open link</a></p>` : ''}<button class="text-button" data-delete-entry="${item.id}" data-table="${table}">Delete</button></li>`).join('')}</ul>` : empty('Nothing here yet.');
-  viewContainer.innerHTML = pageHead(cfg.title, 'Add and manage your personal collection.') + `<form id="collection-form" class="content-form"><h3>Add entry</h3>${formFields}<button class="button primary" type="submit">Save entry</button></form>` + section('Your entries', rows);
+  }).join('') + `<label>Who can see this?<select name="visibility"><option value="private" selected>Only me</option><option value="public">Public (shown on my profile)</option></select></label>`;
+  const rows = data.length ? `<ul class="plain-list">${data.map(item => `<li>${entryBody(item)}<div class="entry-controls"><span class="badge ${item.visibility === 'public' ? 'badge-public' : ''}">${item.visibility === 'public' ? 'Public' : 'Only me'}</span><button class="text-button" type="button" data-toggle-entry-visibility="${item.id}" data-table="${table}" data-current="${item.visibility === 'public' ? 'public' : 'private'}">${item.visibility === 'public' ? 'Make private' : 'Make public'}</button><button class="text-button" data-delete-entry="${item.id}" data-table="${table}">Delete</button></div></li>`).join('')}</ul>` : empty('Nothing here yet.');
+  viewContainer.innerHTML = pageHead(cfg.title, 'Add and manage your collection. Entries marked Public appear on your profile.') + `<form id="collection-form" class="content-form"><h3>Add entry</h3>${formFields}<button class="button primary" type="submit">Save entry</button></form>` + section('Your entries', rows);
 }
 function renderSettings() {
   viewContainer.innerHTML = pageHead('Settings', 'Manage your account and appearance.') +
     section('Appearance', '<p>Choose a theme for this device.</p><button class="button" id="settings-theme">Switch light/dark theme</button>') +
     section('Account', `<p>Email: ${esc(currentUser.email || '')}</p><p>Username: @${esc(currentProfile.username)}</p><p class="muted">Use the log out button in the sidebar to end this session.</p><button class="button" id="reset-password">Send password reset email</button>`) +
-    section('Privacy', '<p class="muted">Your posts use Public, Friends only or Private visibility. Media files in this version are private to their owner. Do not upload sensitive documents.</p>');
+    section('Privacy', '<p class="muted">Your posts use Public, Friends only or Private visibility. Media files are private to their owner. Projects, movies and recommendations are private unless you mark them Public. Do not upload sensitive documents.</p>');
 }
 
 async function handleAuth(event, kind) {
@@ -849,7 +875,7 @@ async function searchUser(form) {
 }
 async function sendFriendRequest(id) {
   const { error } = await supabase.from('friendships').insert({ requester_id: currentUser.id, addressee_id: id, status: 'pending' });
-  toast(error ? error.message : 'Friend request sent.');
+  toast(error ? blockedMessage(error, 'You cannot send a request to this person.') : 'Friend request sent.');
   if (!error) renderView();
 }
 async function acceptFriend(id) {
@@ -901,7 +927,7 @@ async function submitMessage(form) {
   const { error } = await supabase.from('messages').insert({ sender_id: currentUser.id, recipient_id: activeChatUser, body, media_path: mediaPath, media_type: file?.type || null, media_name: file?.name || null, media_size: file?.size || null });
   if (error) {
     if (mediaPath) await supabase.storage.from('message-media').remove([mediaPath]);
-    return toast(error.message);
+    return toast(blockedMessage(error, 'You cannot message this person.'));
   }
   if (messagePreviewUrl) URL.revokeObjectURL(messagePreviewUrl);
   messagePreviewUrl = null;
@@ -1010,6 +1036,50 @@ document.addEventListener('click', async event => {
   const editComment = event.target.closest('[data-edit-comment]'); if (editComment) { const form = $(`[data-edit-comment-form="${editComment.dataset.editComment}"]`); if (form) { form.hidden = !form.hidden; if (!form.hidden) { const input = form.querySelector('input'); input.focus(); input.setSelectionRange(input.value.length,input.value.length); } } return; }
   const replyButton = event.target.closest('[data-reply-comment]'); if (replyButton) { const form = $(`[data-reply-form="${replyButton.dataset.replyComment}"]`); if (form) { form.hidden = !form.hidden; if (!form.hidden) form.querySelector('input')?.focus(); } return; }
   const deleteComment = event.target.closest('[data-delete-comment]'); if (deleteComment) { if (!confirm('Delete this comment?')) return; const { error } = await supabase.from('post_comments').delete().eq('id', deleteComment.dataset.deleteComment).eq('user_id', currentUser.id); if (error) toast(error.message); else { toast('Comment deleted.'); renderView(); } return; }
+  const loadMore = event.target.closest('[data-load-more-posts]');
+  if (loadMore && feedContext) {
+    loadMore.disabled = true; loadMore.textContent = 'Loading…';
+    try {
+      const { data: more, error } = await supabase.from('posts').select('id,user_id,body,visibility,created_at').in('user_id', feedContext.ids).order('created_at', { ascending: false }).range(feedContext.offset, feedContext.offset + PAGE_SIZE - 1);
+      if (error) throw error;
+      const rows = more || [];
+      if (rows.length) loadMore.parentElement.insertAdjacentHTML('beforebegin', await buildPostCards(rows, { allowDelete: feedContext.kind === 'mine' }));
+      feedContext.offset += rows.length;
+      if (rows.length < PAGE_SIZE) loadMore.parentElement.remove(); else { loadMore.disabled = false; loadMore.textContent = 'Load more posts'; }
+    } catch (error) { toast(errorText(error)); loadMore.disabled = false; loadMore.textContent = 'Load more posts'; }
+    return;
+  }
+  const toggleVisibility = event.target.closest('[data-toggle-entry-visibility]');
+  if (toggleVisibility) {
+    const next = toggleVisibility.dataset.current === 'public' ? 'private' : 'public';
+    const { error } = await supabase.from(toggleVisibility.dataset.table).update({ visibility: next }).eq('id', toggleVisibility.dataset.toggleEntryVisibility).eq('user_id', currentUser.id);
+    toast(error ? errorText(error) : next === 'public' ? 'Now public on your profile.' : 'Now visible only to you.');
+    if (!error) renderCollection(toggleVisibility.dataset.table);
+    return;
+  }
+  const blockButton = event.target.closest('[data-block-user]');
+  if (blockButton) {
+    if (!confirm('Block this person? You will be unfriended and stop following each other. They will no longer see your profile or posts, and neither of you can message the other.')) return;
+    const { error } = await supabase.rpc('block_user', { target: blockButton.dataset.blockUser });
+    toast(error ? errorText(error) : 'Person blocked.');
+    if (!error) renderView();
+    return;
+  }
+  const unblockButton = event.target.closest('[data-unblock-user]');
+  if (unblockButton) {
+    const { error } = await supabase.from('blocks').delete().eq('blocker_id', currentUser.id).eq('blocked_id', unblockButton.dataset.unblockUser);
+    toast(error ? errorText(error) : 'Person unblocked.');
+    if (!error) renderView();
+    return;
+  }
+  const reportButton = event.target.closest('[data-report-user]');
+  if (reportButton) {
+    const reason = (window.prompt('Briefly tell us what is wrong (max 500 characters):') || '').trim();
+    if (!reason) return;
+    const { error } = await supabase.from('reports').insert({ reporter_id: currentUser.id, reported_user_id: reportButton.dataset.reportUser, post_id: reportButton.dataset.reportPost || null, reason: reason.slice(0, 500) });
+    toast(error ? errorText(error) : 'Thank you. Your report was sent.');
+    return;
+  }
   const openProfile = event.target.closest('[data-open-profile]'); if (openProfile) { viewedProfileId = openProfile.dataset.openProfile; go('public-profile'); return; }
   const add = event.target.closest('[data-add-friend]'); if (add) { await sendFriendRequest(add.dataset.addFriend); return; }
   const accept = event.target.closest('[data-accept-friend]'); if (accept) { await acceptFriend(accept.dataset.acceptFriend); return; }
