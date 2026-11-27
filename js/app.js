@@ -1,4 +1,4 @@
-import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
+import { createClient } from 'https://esm.sh/@supabase/supabase-js@2.45.4';
 import { SUPABASE_URL, SUPABASE_ANON_KEY, isConfigured } from './config.js';
 import { pageRoutes, viewFromLocation } from './modules/routes.js';
 
@@ -130,7 +130,7 @@ function scheduleRealtimeRefresh(payload) {
         realtimeRefreshTimer = null;
         if (!currentUser || currentView !== 'messages') return;
         if (activeChatUser === otherId) openChat(otherId);
-        else renderChats();
+        else if (!isTypingInView()) renderChats();
       }, 250);
     }
     return;
@@ -147,7 +147,11 @@ function scheduleRealtimeRefresh(payload) {
   else if (['projects','movies','recommendations'].includes(table)) relevant = currentView === table && row.user_id === currentUser.id;
   if (!relevant) return;
   if (realtimeRefreshTimer) window.clearTimeout(realtimeRefreshTimer);
-  realtimeRefreshTimer = window.setTimeout(() => { realtimeRefreshTimer = null; if (currentUser) renderView(); }, 450);
+  realtimeRefreshTimer = window.setTimeout(() => { realtimeRefreshTimer = null; if (currentUser && !isTypingInView()) renderView(); }, 450);
+}
+function isTypingInView() {
+  const el = document.activeElement;
+  return Boolean(el && viewContainer.contains(el) && ['INPUT', 'TEXTAREA'].includes(el.tagName) && el.type !== 'file' && String(el.value || '').trim());
 }
 function showNewPostsIndicator() {
   if (currentView !== 'home' || !$('.section') || $('#new-posts-indicator')) return;
@@ -442,7 +446,14 @@ async function submitEditComment(form) {
 }
 
 async function renderHome() {
-  const { data: posts, error } = await supabase.from('posts').select('id,user_id,body,visibility,created_at').order('created_at', { ascending: false }).limit(8);
+  const [friendRows, followRows] = await Promise.all([
+    supabase.from('friendships').select('requester_id,addressee_id').eq('status', 'accepted').or(`requester_id.eq.${currentUser.id},addressee_id.eq.${currentUser.id}`),
+    supabase.from('follows').select('followed_id').eq('follower_id', currentUser.id)
+  ]);
+  if (friendRows.error) throw friendRows.error;
+  if (followRows.error) throw followRows.error;
+  const feedIds = [...new Set([currentUser.id, ...(friendRows.data || []).map(f => f.requester_id === currentUser.id ? f.addressee_id : f.requester_id), ...(followRows.data || []).map(f => f.followed_id)])];
+  const { data: posts, error } = await supabase.from('posts').select('id,user_id,body,visibility,created_at').in('user_id', feedIds).order('created_at', { ascending: false }).limit(8);
   if (error) throw error;
   const cards = await buildPostCards(posts || []);
   const shortcuts = [
@@ -458,7 +469,7 @@ async function renderHome() {
   viewContainer.innerHTML = pageHead('Home', `Welcome back, ${currentProfile.display_name}.`, '<button class="button primary" id="home-compose-toggle" data-action="new-post" type="button">＋ Write a post</button>') +
     `<div id="home-compose" class="home-compose" hidden>${composer}</div>` +
     `<details class="home-quick-access home-collapsible"><summary>Quick access <span class="muted">6 shortcuts</span></summary><div class="home-shortcuts">${shortcuts}</div></details>` +
-    `<section class="section home-feed-panel"><details class="home-feed-details" open><summary class="section-title">Activity feed <span class="muted">Latest 8 posts</span></summary><div class="home-feed-content">${cards}</div></details></section>`;
+    `<section class="section home-feed-panel"><details class="home-feed-details" open><summary class="section-title">Activity feed <span class="muted">Latest 8 from you, friends and people you follow</span></summary><div class="home-feed-content">${cards}</div></details></section>`;
 }
 async function renderProfile() {
   const p = currentProfile;
@@ -631,7 +642,7 @@ async function renderMedia(kind) {
   if (error) throw error;
   const rendered = [];
   for (const item of items) {
-    let url = item.public_url;
+    let url = safeHttpUrl(item.public_url) || null;
     if (item.storage_path) { const signed = await supabase.storage.from('user-media').createSignedUrl(item.storage_path, 3600); if (!signed.error) url = signed.data.signedUrl; }
     const media = url ? (kind === 'image' ? `<img class="media-preview" src="${esc(url)}" alt="${esc(item.title)}">` : kind === 'video' ? `<video class="media-preview" controls src="${esc(url)}"></video>` : `<audio controls src="${esc(url)}"></audio>`) : '<p class="muted">File link unavailable.</p>';
     rendered.push(`<li><strong>${esc(item.title)}</strong><p>${esc(item.description)}</p>${media}<span class="post-meta">${esc(item.visibility)} · ${new Date(item.created_at).toLocaleDateString()}</span><button class="text-button" data-delete-media="${item.id}" data-storage-path="${esc(item.storage_path || '')}">Delete</button></li>`);
@@ -657,7 +668,7 @@ async function renderCollection(table) {
     const extra = f === 'title' ? 'required maxlength="160"' : f === 'rating' ? 'min="0" max="10" step="0.5"' : f === 'release_year' ? 'min="1880" max="2100"' : '';
     return `<label>${esc(label)}<input name="${f}" type="${type}" ${extra}></label>`;
   }).join('');
-  const rows = data.length ? `<ul class="plain-list">${data.map(item => `<li><strong>${esc(item.title)}</strong><p>${esc(item.description || item.review || '')}</p><span class="post-meta">${esc(item.status || item.category || item.watched_on || '')}${item.rating != null ? ` · Rating ${esc(item.rating)}/10` : ''}</span>${item.url ? `<p><a href="${esc(item.url)}" target="_blank" rel="noopener">Open link</a></p>` : ''}<button class="text-button" data-delete-entry="${item.id}" data-table="${table}">Delete</button></li>`).join('')}</ul>` : empty('Nothing here yet.');
+  const rows = data.length ? `<ul class="plain-list">${data.map(item => `<li><strong>${esc(item.title)}</strong><p>${esc(item.description || item.review || '')}</p><span class="post-meta">${esc(item.status || item.category || item.watched_on || '')}${item.rating != null ? ` · Rating ${esc(item.rating)}/10` : ''}</span>${safeHttpUrl(item.url) ? `<p><a href="${esc(safeHttpUrl(item.url))}" target="_blank" rel="noopener noreferrer">Open link</a></p>` : ''}<button class="text-button" data-delete-entry="${item.id}" data-table="${table}">Delete</button></li>`).join('')}</ul>` : empty('Nothing here yet.');
   viewContainer.innerHTML = pageHead(cfg.title, 'Add and manage your personal collection.') + `<form id="collection-form" class="content-form"><h3>Add entry</h3>${formFields}<button class="button primary" type="submit">Save entry</button></form>` + section('Your entries', rows);
 }
 function renderSettings() {
@@ -700,7 +711,8 @@ async function handleAuth(event, kind) {
       }
     }
   } catch (error) {
-    setAuthMessage(errorText(error), true);
+    const text = errorText(error);
+    setAuthMessage(kind === 'register' && /database error saving new user/i.test(text) ? 'That username is already taken. Please choose another one.' : text, true);
   } finally { setBusy(formEl, false); }
 }
 async function submitProfile(form) {
