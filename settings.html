@@ -5,74 +5,13 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="description" content="A personal space on the internet.">
   <title>Settings | Personal Space</title>
+  <script src="js/theme-init.js"></script>
   <link rel="stylesheet" href="css/main.css">
   <link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
 </head>
 <body>
-  <div id="auth-screen" class="auth-screen">
-    <section class="auth-panel">
-      <p class="eyebrow">YOUR CORNER OF THE INTERNET</p>
-      <h1>Personal Space</h1>
-      <p class="muted">A place for your thoughts, projects, media and people.</p>
-      <div id="setup-notice" class="notice" hidden>
-        <strong>Backend setup required</strong>
-        <p>This project is ready for Supabase, but it is not connected yet. Add your project URL and public anon key in <code>js/config.js</code>, then run the database script in <code>supabase/schema.sql</code>.</p>
-      </div>
-      <div class="auth-tabs" role="tablist" aria-label="Account access">
-        <button class="auth-tab active" data-auth-tab="login" type="button">Log in</button>
-        <button class="auth-tab" data-auth-tab="register" type="button">Create account</button>
-      </div>
-      <form id="login-form" class="form-stack">
-        <label>Email<input name="email" type="email" autocomplete="email" required></label>
-        <label>Password<input name="password" type="password" autocomplete="current-password" required minlength="8"></label>
-        <button class="button primary" type="submit">Log in</button>
-        <button class="text-button" id="forgot-password" type="button">Forgot password?</button>
-      </form>
-      <form id="register-form" class="form-stack" hidden>
-        <label>Display name<input name="display_name" autocomplete="name" required maxlength="60"></label>
-        <label>Username<input name="username" autocomplete="username" required minlength="3" maxlength="24" pattern="[A-Za-z0-9_]+"><small>Letters, numbers and underscores only.</small></label>
-        <label>Email<input name="email" type="email" autocomplete="email" required></label>
-        <label>Password<input name="password" type="password" autocomplete="new-password" required minlength="8"></label>
-        <button class="button primary" type="submit">Create account</button>
-      </form>
-      <p id="auth-message" class="form-message" role="status"></p>
-      <p class="tiny muted">Your account and content require a connected backend. This starter does not store passwords locally.</p>
-    </section>
-  </div>
-
-  <div id="app" class="app-shell" hidden>
-    <aside id="sidebar" class="sidebar">
-      <div class="brand-row"><a class="brand" href="index.html" data-view="home">PERSONAL SPACE</a><div class="sidebar-head-actions"><button id="collapse-sidebar" class="icon-button desktop-collapse" type="button" aria-label="Collapse sidebar" title="Collapse sidebar">‹</button><button id="close-mobile-sidebar" class="icon-button mobile-sidebar-close" type="button" aria-label="Close navigation" title="Close navigation">×</button></div></div>
-      <div class="side-profile"><div class="avatar" id="side-avatar">?</div><div class="side-profile-text"><strong id="side-name">Your name</strong><span id="side-handle">@username</span></div></div>
-      <nav class="navigation" aria-label="Main navigation">
-        <p class="nav-heading">GENERAL</p>
-        <a href="index.html" class="nav-link active" data-view="home"><span class="nav-icon">⌂</span><span>Home</span></a>
-        <a href="profile.html" class="nav-link" data-view="profile"><span class="nav-icon">◉</span><span>My profile</span></a>
-        <a href="posts.html" class="nav-link" data-view="posts"><span class="nav-icon">▤</span><span>Posts</span></a>
-        <a href="friends.html" class="nav-link" data-view="friends"><span class="nav-icon">♧</span><span>Friends & followers</span></a>
-        <a href="chats.html" class="nav-link" data-view="messages"><span class="nav-icon">✉</span><span>Chats</span></a>
-        <p class="nav-heading">MEDIA</p>
-        <a href="media.html?type=images" class="nav-link" data-view="images"><span class="nav-icon">▧</span><span>Images</span></a>
-        <a href="media.html?type=videos" class="nav-link" data-view="videos"><span class="nav-icon">▷</span><span>Videos</span></a>
-        <a href="media.html?type=audio" class="nav-link" data-view="audio"><span class="nav-icon">♫</span><span>Audio</span></a>
-        <p class="nav-heading">PERSONAL</p>
-        <a href="projects.html" class="nav-link" data-view="projects"><span class="nav-icon">⌘</span><span>Projects & games</span></a>
-        <a href="movies.html" class="nav-link" data-view="movies"><span class="nav-icon">▣</span><span>Movies</span></a>
-        <a href="recommendations.html" class="nav-link" data-view="recommendations"><span class="nav-icon">↗</span><span>Recommendations</span></a>
-        <p class="nav-heading">ACCOUNT</p>
-        <a href="settings.html" class="nav-link" data-view="settings"><span class="nav-icon">⚙</span><span>Settings</span></a>
-      </nav>
-      <button id="logout-button" class="logout-button" type="button">↪ <span>Log out</span></button>
-    </aside>
-    <div id="sidebar-backdrop" class="sidebar-backdrop" hidden></div>
-
-    <main class="main-area">
-      <header class="topbar"><button id="mobile-menu" class="icon-button mobile-menu" type="button" aria-label="Open navigation" aria-expanded="false" title="Open navigation">☰</button><div class="breadcrumb" id="breadcrumb">Home</div><div class="topbar-actions"><button id="theme-toggle" class="icon-button topbar-icon" type="button" aria-label="Switch to dark theme" data-tooltip="Dark theme" title="Dark theme"><span class="theme-icon" aria-hidden="true">☾</span></button></div></header>
-      <div id="app-notice" class="app-notice" hidden></div>
-      <section id="view-container" class="view-container" aria-live="polite"></section>
-    </main>
-  </div>
-  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  <p id="boot" class="boot">Loading…</p>
+  <noscript><p class="boot">Personal Space needs JavaScript turned on.</p></noscript>
   <script type="module" src="js/app.js"></script>
 </body>
 </html>
